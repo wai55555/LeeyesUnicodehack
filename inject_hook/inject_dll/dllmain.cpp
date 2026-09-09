@@ -741,7 +741,7 @@ __out_opt HANDLE WINAPI CreateMutexAHook(    __in_opt LPSECURITY_ATTRIBUTES lpMu
     )
 {
 	auto ret = originalCreateMutexA( lpMutexAttributes, bInitialOwner, lpName );
-	if( strcmp(lpName, "Leeyes@Kenji" )  == 0 )
+	if( lpName && strcmp(lpName, "Leeyes@Kenji" )  == 0 )
 	{
 		if(::GetLastError() == ERROR_ALREADY_EXISTS)
 		{
@@ -752,9 +752,62 @@ __out_opt HANDLE WINAPI CreateMutexAHook(    __in_opt LPSECURITY_ATTRIBUTES lpMu
 }
 void hookCreateMutexA()
 {
-	originalCreateMutexA = nCodeHook.createHookByName("kernel32.dll", "CreateMutexA", CreateMutexAHook);
+	originalCreateMutexA = nCodeHook.createHookByName("kernelbase.dll", "CreateMutexA", CreateMutexAHook);
+	FILE* lf = nullptr;
+	if( fopen_s(&lf, "C:\\tool\\leeyes\\leeyes261\\_path_debug.txt", "a") == 0 && lf )
+	{
+		fprintf(lf, "hookCreateMutexA install %s\n", originalCreateMutexA ? "OK" : "FAILED");
+		fclose(lf);
+	}
 }
 
+}
+
+namespace User32
+{
+	typedef BOOL (WINAPI *SetWindowTextAFPtr)( HWND hWnd, LPCSTR lpString );
+	SetWindowTextAFPtr originalSetWindowTextA = nullptr;
+
+	bool LooksLikePath( LPCSTR text )
+	{
+		if( !text || !*text ) return false;
+		return (text[0] && text[1] == ':' && (text[2] == '\\' || text[2] == '/'))
+			|| strchr( text, '\\' ) != nullptr
+			|| strchr( text, '/' ) != nullptr;
+	}
+
+	BOOL WINAPI SetWindowTextAHook( HWND hWnd, LPCSTR lpString )
+	{
+		static thread_local bool resolving = false;
+		if( !resolving && lpString && strchr( lpString, '?' ) != nullptr
+			&& LooksLikePath( lpString ) && ::IsWindowUnicode( hWnd ) )
+		{
+			resolving = true;
+			std::wstring resolved = Utility::GetWidePath( lpString );
+			bool resolvedSuccessfully = !resolved.empty()
+				&& resolved.find( L'?' ) == std::wstring::npos
+				&& ::GetFileAttributesW( resolved.c_str() ) != INVALID_FILE_ATTRIBUTES;
+			if( resolvedSuccessfully )
+			{
+				BOOL ret = ::SetWindowTextW( hWnd, resolved.c_str() );
+				resolving = false;
+				return ret;
+			}
+			resolving = false;
+		}
+		return originalSetWindowTextA( hWnd, lpString );
+	}
+
+	void hookSetWindowTextA()
+	{
+		originalSetWindowTextA = nCodeHook.createHookByName("user32.dll", "SetWindowTextA", SetWindowTextAHook);
+		FILE* lf = nullptr;
+		if( fopen_s(&lf, "C:\\tool\\leeyes\\leeyes261\\_path_debug.txt", "a") == 0 && lf )
+		{
+			fprintf(lf, "hookSetWindowTextA install %s\n", originalSetWindowTextA ? "OK" : "FAILED");
+			fclose(lf);
+		}
+	}
 }
 
 namespace Shell32
@@ -1365,6 +1418,10 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 			Kernel32::hookCreateFile2();
 			Kernel32::hookGetFileAttributesA();
 			Kernel32::hookGetFileAttributesExA();
+		}
+		if( Profile->Get("Option","HookSetWindowText",UINT() ) )
+		{
+			User32::hookSetWindowTextA();
 		}
 		//�p�X�Ɖ摜�t�@�C������Unicode�Ȃ炱�ꂾ���ł����邪���Ƀt�@�C�����ʖ�
 		Shell32::hookSHBindToParent();
