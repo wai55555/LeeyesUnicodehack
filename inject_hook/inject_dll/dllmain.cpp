@@ -17,6 +17,13 @@
 //#include <concurrent_unordered_set.h>
 //#include <concurrent_unordered_map.h>
 
+// File-level tracing is useful while investigating a new API path, but opening
+// and closing a log file for every image access makes normal thumbnail loading
+// disproportionately slow. Enable explicitly for diagnostics when needed.
+#ifndef UNICODEHACK_PATH_DEBUG
+#define UNICODEHACK_PATH_DEBUG 0
+#endif
+
 // NOTE: every injected dll has to export at least one symbol - otherwise
 // the OS loader will fail with STATUS_INVALID_IMAGE_FORMAT (0x0C000007B)
 __declspec(dllexport) void dummyExport() {}
@@ -24,12 +31,43 @@ __declspec(dllexport) void dummyExport() {}
 // NOTE: this needs to be in global scope - otherwise the trampolines and hooks
 // are deleted when the destructor of nCodeHook is called!
 NCodeHookIA32 nCodeHook;
+HMODULE gInjectedModule = nullptr;
 
 namespace Utility
 {
+	std::map<std::string, std::wstring> gWidePathCache;
+	std::mutex gWidePathCacheMutex;
+
+	const char* GetPathDebugLogPath()
+	{
+		static std::string path;
+		if( path.empty() )
+		{
+			char modulePath[MAX_PATH] = {};
+			if( gInjectedModule && ::GetModuleFileNameA(gInjectedModule, modulePath, MAX_PATH) )
+			{
+				char* slash = strrchr( modulePath, '\\' );
+				if( slash )
+				{
+					*(slash + 1) = '\0';
+					path = modulePath;
+					path += "_path_debug.txt";
+				}
+			}
+			if( path.empty() ) path = "_path_debug.txt";
+		}
+		return path.c_str();
+	}
 	
 std::wstring GetWidePath( std::string Path )
 {
+	if( Path.find('?') != std::string::npos )
+	{
+		std::lock_guard<std::mutex> lock(gWidePathCacheMutex);
+		auto it = gWidePathCache.find( Path );
+		if( it != gWidePathCache.end() ) return it->second;
+	}
+
 	std::wstring settled_path ;
 	std::string tmp;
 	wchar_t wide_file_name[MAX_PATH]={};
@@ -127,6 +165,11 @@ std::wstring GetWidePath( std::string Path )
 			settled_path .append( wide_file_name );
 		}
 	}	
+	if( Path.find('?') != std::string::npos && settled_path.find(L'?') == std::wstring::npos )
+	{
+		std::lock_guard<std::mutex> lock(gWidePathCacheMutex);
+		gWidePathCache[Path] = settled_path;
+	}
 	return settled_path ;
 }
 
@@ -263,8 +306,28 @@ namespace Kernel32
 {
 #if 1
 
-std::map<HANDLE, std::wstring> gSearchParentDir;
+struct SearchContext
+{
+	std::string parentDirAnsi;
+	std::wstring parentDirWide;
+};
+
+std::map<HANDLE, SearchContext> gSearchParentDir;
 std::mutex gSearchParentDirMutex;
+
+bool HasUnknownChar( LPCSTR text )
+{
+	if( !text ) return false;
+	return strchr( text, '?' ) != nullptr;
+}
+
+void ResolveSearchParentDir( SearchContext& context )
+{
+	if( context.parentDirWide.empty() && !context.parentDirAnsi.empty() )
+	{
+		context.parentDirWide = Utility::GetWidePath( context.parentDirAnsi );
+	}
+}
 
 // cFileName may come back from the OS with '?' standing in for characters that don't fit
 // CP932. Prefer the 8.3 alternate name when one exists; when it doesn't (8.3 name generation
@@ -317,24 +380,41 @@ HANDLE  WINAPI FindFirstFileHook(LPCTSTR lpFileName,  LPWIN32_FIND_DATA lpFindFi
 	HANDLE ret = originalFindFirstFile(lpFileName,lpFindFileData);
 	if( ret != INVALID_HANDLE_VALUE )
 	{
-		std::wstring parentDirWide;
-		std::string searchPattern( lpFileName );
+		SearchContext context;
+		std::string searchPattern( lpFileName ? lpFileName : "" );
 		auto slashPos = searchPattern.find_last_of( '\\' );
 		if( slashPos != std::string::npos )
 		{
-			parentDirWide = Utility::GetWidePath( searchPattern.substr( 0, slashPos ) );
+			context.parentDirAnsi = searchPattern.substr( 0, slashPos );
+		}
+		if( HasUnknownChar( lpFindFileData->cFileName ) )
+		{
+			ResolveSearchParentDir( context );
 		}
 		{
 			std::lock_guard<std::mutex> lock(gSearchParentDirMutex);
-			gSearchParentDir[ret] = parentDirWide;
+			gSearchParentDir[ret] = context;
 		}
-		FixupFindData( parentDirWide, lpFindFileData );
+		if( !context.parentDirWide.empty() )
+		{
+			FixupFindData( context.parentDirWide, lpFindFileData );
+		}
 	}
 	return ret;
 }
 void hookFindFirstFile()
 {
-	originalFindFirstFile = nCodeHook.createHookByName("kernel32.dll", "FindFirstFileA", FindFirstFileHook);
+	originalFindFirstFile = nCodeHook.createHookByName("kernelbase.dll", "FindFirstFileA", FindFirstFileHook);
+	if( !originalFindFirstFile )
+	{
+		originalFindFirstFile = nCodeHook.createHookByName("kernel32.dll", "FindFirstFileA", FindFirstFileHook);
+	}
+	FILE* lf = nullptr;
+	if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+	{
+		fprintf(lf, "hookFindFirstFile install %s\n", originalFindFirstFile ? "OK" : "FAILED");
+		fclose(lf);
+	}
 }
 
 
@@ -344,13 +424,17 @@ FindNextFileFPtr originalFindNextFile = nullptr;
 HANDLE  WINAPI FindNextFileHook(HANDLE hFindFile,       LPWIN32_FIND_DATA lpFindFileData   )
 {
 	HANDLE ret = originalFindNextFile(hFindFile,lpFindFileData);
-	if( ret != INVALID_HANDLE_VALUE )
+	if( ret != INVALID_HANDLE_VALUE && HasUnknownChar( lpFindFileData->cFileName ) )
 	{
 		std::wstring parentDirWide;
 		{
 			std::lock_guard<std::mutex> lock(gSearchParentDirMutex);
 			auto it = gSearchParentDir.find( hFindFile );
-			if( it != gSearchParentDir.end() ) parentDirWide = it->second;
+			if( it != gSearchParentDir.end() )
+			{
+				ResolveSearchParentDir( it->second );
+				parentDirWide = it->second.parentDirWide;
+			}
 		}
 		FixupFindData( parentDirWide, lpFindFileData );
 	}
@@ -358,7 +442,17 @@ HANDLE  WINAPI FindNextFileHook(HANDLE hFindFile,       LPWIN32_FIND_DATA lpFind
 }
 void hookFindNextFile()
 {
-	originalFindNextFile = nCodeHook.createHookByName("kernel32.dll", "FindNextFileA", FindNextFileHook);
+	originalFindNextFile = nCodeHook.createHookByName("kernelbase.dll", "FindNextFileA", FindNextFileHook);
+	if( !originalFindNextFile )
+	{
+		originalFindNextFile = nCodeHook.createHookByName("kernel32.dll", "FindNextFileA", FindNextFileHook);
+	}
+	FILE* lf = nullptr;
+	if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+	{
+		fprintf(lf, "hookFindNextFile install %s\n", originalFindNextFile ? "OK" : "FAILED");
+		fclose(lf);
+	}
 }
 #endif
 
@@ -384,21 +478,41 @@ HANDLE  WINAPI CreateFileAHook(    __in     LPCSTR lpFileName,
     __in_opt HANDLE hTemplateFile
 )
 {
-	HANDLE ret = originalCreateFileA(lpFileName,dwDesiredAccess, dwShareMode,lpSecurityAttributes,dwCreationDisposition,dwFlagsAndAttributes  ,hTemplateFile   );
+	bool hasUnknown = lpFileName && strchr( lpFileName, '?' ) != nullptr;
+	std::wstring resolvedWide;
+	bool wideAttempted = false;
+	HANDLE ret = INVALID_HANDLE_VALUE;
+	if( hasUnknown )
+	{
+		resolvedWide = Utility::GetWidePath( lpFileName );
+		if( !resolvedWide.empty() && resolvedWide.find(L'?') == std::wstring::npos )
+		{
+			ret = ::CreateFileW( resolvedWide.c_str(), dwDesiredAccess, dwShareMode, lpSecurityAttributes,
+				dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile );
+			wideAttempted = true;
+		}
+	}
+	if( !wideAttempted )
+	{
+		ret = originalCreateFileA(lpFileName,dwDesiredAccess, dwShareMode,lpSecurityAttributes,dwCreationDisposition,dwFlagsAndAttributes  ,hTemplateFile   );
+	}
+#if UNICODEHACK_PATH_DEBUG
 	{
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, "C:\\tool\\leeyes\\leeyes261\\_path_debug.txt", "a") == 0 && lf )
+		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
 		{
 			fprintf(lf, "CreateFileA in=[%s] ret=%s\n", lpFileName ? lpFileName : "<null>", (ret != INVALID_HANDLE_VALUE) ? "SUCCESS" : "FAIL");
 			fclose(lf);
 		}
 	}
-	if( ret == INVALID_HANDLE_VALUE )
+#endif
+	if( ret == INVALID_HANDLE_VALUE && !wideAttempted )
 	{
-		auto resolvedWide = Utility::GetWidePath( lpFileName );
+		if( resolvedWide.empty() ) resolvedWide = Utility::GetWidePath( lpFileName );
+	#if UNICODEHACK_PATH_DEBUG
 		{
 			FILE* lf = nullptr;
-			if( fopen_s(&lf, "C:\\tool\\leeyes\\leeyes261\\_path_debug.txt", "a") == 0 && lf )
+			if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
 			{
 				fprintf(lf, "ansi_in=[%s]\n", lpFileName);
 				char wideAsAnsiForLog[MAX_PATH*2] = {};
@@ -407,16 +521,19 @@ HANDLE  WINAPI CreateFileAHook(    __in     LPCSTR lpFileName,
 				fclose(lf);
 			}
 		}
+	#endif
 		ret = CreateFileW(resolvedWide.c_str(), dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes  ,hTemplateFile   );
 		DWORD lastErr2 = ::GetLastError();
+	#if UNICODEHACK_PATH_DEBUG
 		{
 			FILE* lf = nullptr;
-			if( fopen_s(&lf, "C:\\tool\\leeyes\\leeyes261\\_path_debug.txt", "a") == 0 && lf )
+			if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
 			{
 				fprintf(lf, "CreateFileW result: %s (lastError=%lu)\n", (ret != INVALID_HANDLE_VALUE) ? "SUCCESS" : "FAIL", lastErr2);
 				fclose(lf);
 			}
 		}
+	#endif
 		::SetLastError(lastErr2);
 	}
 	return ret;
@@ -425,7 +542,7 @@ void hookCreateFileA()
 {
 	originalCreateFileA = nCodeHook.createHookByName("kernelbase.dll", "CreateFileA", CreateFileAHook);
 	FILE* lf = nullptr;
-	if( fopen_s(&lf, "C:\\tool\\leeyes\\leeyes261\\_path_debug.txt", "a") == 0 && lf )
+	if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
 	{
 		fprintf(lf, "hookCreateFileA install %s\n", originalCreateFileA ? "OK" : "FAILED");
 		fclose(lf);
@@ -456,9 +573,10 @@ HANDLE  WINAPI CreateFileWHook(    __in     LPCWSTR lpFileName,
 )
 {
 	HANDLE ret = originalCreateFileW(lpFileName,dwDesiredAccess, dwShareMode,lpSecurityAttributes,dwCreationDisposition,dwFlagsAndAttributes  ,hTemplateFile   );
+#if UNICODEHACK_PATH_DEBUG
 	{
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, "C:\\tool\\leeyes\\leeyes261\\_path_debug.txt", "a") == 0 && lf )
+		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
 		{
 			char utf8[MAX_PATH*2] = {};
 			WideCharToMultiByte(CP_UTF8, 0, lpFileName ? lpFileName : L"<null>", -1, utf8, sizeof(utf8), 0, 0);
@@ -466,13 +584,14 @@ HANDLE  WINAPI CreateFileWHook(    __in     LPCWSTR lpFileName,
 			fclose(lf);
 		}
 	}
+#endif
 	return ret;
 }
 void hookCreateFileW()
 {
 	originalCreateFileW = nCodeHook.createHookByName("kernelbase.dll", "CreateFileW", CreateFileWHook);
 	FILE* lf = nullptr;
-	if( fopen_s(&lf, "C:\\tool\\leeyes\\leeyes261\\_path_debug.txt", "a") == 0 && lf )
+	if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
 	{
 		fprintf(lf, "hookCreateFileW install %s\n", originalCreateFileW ? "OK" : "FAILED");
 		fclose(lf);
@@ -489,9 +608,10 @@ CreateFile2FPtr originalCreateFile2 = nullptr;
 HANDLE WINAPI CreateFile2Hook(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, DWORD dwCreationDisposition, LPVOID pCreateExParams)
 {
 	HANDLE ret = originalCreateFile2(lpFileName, dwDesiredAccess, dwShareMode, dwCreationDisposition, pCreateExParams);
+#if UNICODEHACK_PATH_DEBUG
 	{
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, "C:\\tool\\leeyes\\leeyes261\\_path_debug.txt", "a") == 0 && lf )
+		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
 		{
 			char utf8[MAX_PATH*2] = {};
 			WideCharToMultiByte(CP_UTF8, 0, lpFileName ? lpFileName : L"<null>", -1, utf8, sizeof(utf8), 0, 0);
@@ -499,13 +619,14 @@ HANDLE WINAPI CreateFile2Hook(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD d
 			fclose(lf);
 		}
 	}
+#endif
 	return ret;
 }
 void hookCreateFile2()
 {
 	originalCreateFile2 = nCodeHook.createHookByName("kernelbase.dll", "CreateFile2", CreateFile2Hook);
 	FILE* lf = nullptr;
-	if( fopen_s(&lf, "C:\\tool\\leeyes\\leeyes261\\_path_debug.txt", "a") == 0 && lf )
+	if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
 	{
 		fprintf(lf, "hookCreateFile2 install %s\n", originalCreateFile2 ? "OK" : "FAILED");
 		fclose(lf);
@@ -521,21 +642,37 @@ typedef DWORD (WINAPI *GetFileAttributesAFPtr)( LPCSTR lpFileName );
 GetFileAttributesAFPtr originalGetFileAttributesA = nullptr;
 DWORD WINAPI GetFileAttributesAHook( LPCSTR lpFileName )
 {
-	DWORD ret = originalGetFileAttributesA( lpFileName );
+	bool hasUnknown = lpFileName && strchr( lpFileName, '?' ) != nullptr;
+	std::wstring resolvedWide;
+	bool wideAttempted = false;
+	DWORD ret = INVALID_FILE_ATTRIBUTES;
+	if( hasUnknown )
+	{
+		resolvedWide = Utility::GetWidePath( lpFileName );
+		if( !resolvedWide.empty() && resolvedWide.find(L'?') == std::wstring::npos )
+		{
+			ret = ::GetFileAttributesW( resolvedWide.c_str() );
+			wideAttempted = true;
+		}
+	}
+	if( !wideAttempted ) ret = originalGetFileAttributesA( lpFileName );
+#if UNICODEHACK_PATH_DEBUG
 	{
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, "C:\\tool\\leeyes\\leeyes261\\_path_debug.txt", "a") == 0 && lf )
+		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
 		{
 			fprintf(lf, "GetFileAttributesA in=[%s] ret=%s\n", lpFileName ? lpFileName : "<null>", (ret != INVALID_FILE_ATTRIBUTES) ? "SUCCESS" : "FAIL");
 			fclose(lf);
 		}
 	}
-	if( ret == INVALID_FILE_ATTRIBUTES )
+#endif
+	if( ret == INVALID_FILE_ATTRIBUTES && !wideAttempted )
 	{
-		auto resolvedWide = Utility::GetWidePath( lpFileName );
+		if( resolvedWide.empty() ) resolvedWide = Utility::GetWidePath( lpFileName );
 		ret = ::GetFileAttributesW( resolvedWide.c_str() );
+#if UNICODEHACK_PATH_DEBUG
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, "C:\\tool\\leeyes\\leeyes261\\_path_debug.txt", "a") == 0 && lf )
+		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
 		{
 			char wideAsAnsiForLog[MAX_PATH*2] = {};
 			WideCharToMultiByte(CP_UTF8, 0, resolvedWide.c_str(), -1, wideAsAnsiForLog, sizeof(wideAsAnsiForLog), 0, 0);
@@ -543,6 +680,7 @@ DWORD WINAPI GetFileAttributesAHook( LPCSTR lpFileName )
 				lpFileName, wideAsAnsiForLog, (ret != INVALID_FILE_ATTRIBUTES) ? "SUCCESS" : "FAIL");
 			fclose(lf);
 		}
+#endif
 	}
 	return ret;
 }
@@ -550,7 +688,7 @@ void hookGetFileAttributesA()
 {
 	originalGetFileAttributesA = nCodeHook.createHookByName("kernelbase.dll", "GetFileAttributesA", GetFileAttributesAHook);
 	FILE* lf = nullptr;
-	if( fopen_s(&lf, "C:\\tool\\leeyes\\leeyes261\\_path_debug.txt", "a") == 0 && lf )
+	if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
 	{
 		fprintf(lf, "hookGetFileAttributesA install %s\n", originalGetFileAttributesA ? "OK" : "FAILED");
 		fclose(lf);
@@ -561,18 +699,34 @@ typedef BOOL (WINAPI *GetFileAttributesExAFPtr)( LPCSTR lpFileName, GET_FILEEX_I
 GetFileAttributesExAFPtr originalGetFileAttributesExA = nullptr;
 BOOL WINAPI GetFileAttributesExAHook( LPCSTR lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId, LPVOID lpFileInformation )
 {
-	BOOL ret = originalGetFileAttributesExA( lpFileName, fInfoLevelId, lpFileInformation );
+	bool hasUnknown = lpFileName && strchr( lpFileName, '?' ) != nullptr;
+	std::wstring resolvedWide;
+	bool wideAttempted = false;
+	BOOL ret = FALSE;
+	if( hasUnknown )
+	{
+		resolvedWide = Utility::GetWidePath( lpFileName );
+		if( !resolvedWide.empty() && resolvedWide.find(L'?') == std::wstring::npos )
+		{
+			ret = ::GetFileAttributesExW( resolvedWide.c_str(), fInfoLevelId, lpFileInformation );
+			wideAttempted = true;
+		}
+	}
+	if( !wideAttempted ) ret = originalGetFileAttributesExA( lpFileName, fInfoLevelId, lpFileInformation );
+#if UNICODEHACK_PATH_DEBUG
 	{
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, "C:\\tool\\leeyes\\leeyes261\\_path_debug.txt", "a") == 0 && lf )
+		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
 		{
 			fprintf(lf, "GetFileAttributesExA in=[%s] ret=%s\n", lpFileName ? lpFileName : "<null>", ret ? "SUCCESS" : "FAIL");
 			fclose(lf);
 		}
 	}
-	if( !ret )
+#endif
+	if( !ret && !wideAttempted )
 	{
-		ret = ::GetFileAttributesExW( Utility::GetWidePath( lpFileName ).c_str(), fInfoLevelId, lpFileInformation );
+		if( resolvedWide.empty() ) resolvedWide = Utility::GetWidePath( lpFileName );
+		ret = ::GetFileAttributesExW( resolvedWide.c_str(), fInfoLevelId, lpFileInformation );
 	}
 	return ret;
 }
@@ -580,7 +734,7 @@ void hookGetFileAttributesExA()
 {
 	originalGetFileAttributesExA = nCodeHook.createHookByName("kernelbase.dll", "GetFileAttributesExA", GetFileAttributesExAHook);
 	FILE* lf = nullptr;
-	if( fopen_s(&lf, "C:\\tool\\leeyes\\leeyes261\\_path_debug.txt", "a") == 0 && lf )
+	if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
 	{
 		fprintf(lf, "hookGetFileAttributesExA install %s\n", originalGetFileAttributesExA ? "OK" : "FAILED");
 		fclose(lf);
@@ -754,7 +908,7 @@ void hookCreateMutexA()
 {
 	originalCreateMutexA = nCodeHook.createHookByName("kernelbase.dll", "CreateMutexA", CreateMutexAHook);
 	FILE* lf = nullptr;
-	if( fopen_s(&lf, "C:\\tool\\leeyes\\leeyes261\\_path_debug.txt", "a") == 0 && lf )
+	if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
 	{
 		fprintf(lf, "hookCreateMutexA install %s\n", originalCreateMutexA ? "OK" : "FAILED");
 		fclose(lf);
@@ -767,6 +921,8 @@ namespace User32
 {
 	typedef BOOL (WINAPI *SetWindowTextAFPtr)( HWND hWnd, LPCSTR lpString );
 	SetWindowTextAFPtr originalSetWindowTextA = nullptr;
+	typedef LRESULT (WINAPI *SendMessageAFPtr)( HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam );
+	SendMessageAFPtr originalSendMessageA = nullptr;
 
 	bool LooksLikePath( LPCSTR text )
 	{
@@ -776,35 +932,70 @@ namespace User32
 			|| strchr( text, '/' ) != nullptr;
 	}
 
+	bool TryResolvePathText( HWND hWnd, LPCSTR text, std::wstring& resolved )
+	{
+		if( !text || strchr( text, '?' ) == nullptr || !LooksLikePath( text )
+			|| !::IsWindowUnicode( hWnd ) ) return false;
+
+		resolved = Utility::GetWidePath( text );
+		return !resolved.empty()
+			&& resolved.find( L'?' ) == std::wstring::npos
+			&& ::GetFileAttributesW( resolved.c_str() ) != INVALID_FILE_ATTRIBUTES;
+	}
+
 	BOOL WINAPI SetWindowTextAHook( HWND hWnd, LPCSTR lpString )
 	{
 		static thread_local bool resolving = false;
-		if( !resolving && lpString && strchr( lpString, '?' ) != nullptr
-			&& LooksLikePath( lpString ) && ::IsWindowUnicode( hWnd ) )
+		std::wstring resolved;
+		if( !resolving && TryResolvePathText( hWnd, lpString, resolved ) )
 		{
 			resolving = true;
-			std::wstring resolved = Utility::GetWidePath( lpString );
-			bool resolvedSuccessfully = !resolved.empty()
-				&& resolved.find( L'?' ) == std::wstring::npos
-				&& ::GetFileAttributesW( resolved.c_str() ) != INVALID_FILE_ATTRIBUTES;
-			if( resolvedSuccessfully )
-			{
-				BOOL ret = ::SetWindowTextW( hWnd, resolved.c_str() );
-				resolving = false;
-				return ret;
-			}
+			BOOL ret = ::SetWindowTextW( hWnd, resolved.c_str() );
 			resolving = false;
+			return ret;
 		}
 		return originalSetWindowTextA( hWnd, lpString );
+	}
+
+	bool IsTextMessage( UINT message )
+	{
+		switch( message )
+		{
+		case WM_SETTEXT:
+		case CB_ADDSTRING:
+		case CB_INSERTSTRING:
+		case LB_ADDSTRING:
+		case LB_INSERTSTRING:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	LRESULT WINAPI SendMessageAHook( HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam )
+	{
+		static thread_local bool resolving = false;
+		std::wstring resolved;
+		if( !resolving && IsTextMessage( message )
+			&& TryResolvePathText( hWnd, reinterpret_cast<LPCSTR>(lParam), resolved ) )
+		{
+			resolving = true;
+			LRESULT ret = ::SendMessageW( hWnd, message, wParam, reinterpret_cast<LPARAM>(resolved.c_str()) );
+			resolving = false;
+			return ret;
+		}
+		return originalSendMessageA( hWnd, message, wParam, lParam );
 	}
 
 	void hookSetWindowTextA()
 	{
 		originalSetWindowTextA = nCodeHook.createHookByName("user32.dll", "SetWindowTextA", SetWindowTextAHook);
+		originalSendMessageA = nCodeHook.createHookByName("user32.dll", "SendMessageA", SendMessageAHook);
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, "C:\\tool\\leeyes\\leeyes261\\_path_debug.txt", "a") == 0 && lf )
+		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
 		{
-			fprintf(lf, "hookSetWindowTextA install %s\n", originalSetWindowTextA ? "OK" : "FAILED");
+			fprintf(lf, "hookSetWindowTextA install %s, SendMessageA install %s\n",
+				originalSetWindowTextA ? "OK" : "FAILED", originalSendMessageA ? "OK" : "FAILED");
 			fclose(lf);
 		}
 	}
@@ -1102,14 +1293,16 @@ GetFileAM00FPtr originalGetFile = nullptr;
 int __stdcall IsSupportedHook(LPSTR Filename, DWORD Dw)
 {
 	auto ret =originalIsSupported( Filename, Dw );
+#if UNICODEHACK_PATH_DEBUG
 	{
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, "C:\\tool\\leeyes\\leeyes261\\_path_debug.txt", "a") == 0 && lf )
+		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
 		{
 			fprintf(lf, "IsSupported Filename=[%s] Dw=%lu ret=%d\n", (Dw < 0x10000 && Filename) ? Filename : "<buffer-or-null>", (unsigned long)Dw, ret);
 			fclose(lf);
 		}
 	}
+#endif
 	// Per the Susie SPI convention, Dw is either a small flag/handle value or - when
 	// large enough to plausibly be one - a pointer to a header buffer the caller already
 	// read itself; only in the filename+flag case does the plugin need to open the file
@@ -1118,12 +1311,14 @@ int __stdcall IsSupportedHook(LPSTR Filename, DWORD Dw)
 	{
 		auto retryPath = Utility::GetShortPath( Filename );
 		ret = originalIsSupported( const_cast<LPSTR>(retryPath.c_str()), Dw );
+#if UNICODEHACK_PATH_DEBUG
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, "C:\\tool\\leeyes\\leeyes261\\_path_debug.txt", "a") == 0 && lf )
+		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
 		{
 			fprintf(lf, "IsSupported retry=[%s] ret=%d\n", retryPath.c_str(), ret);
 			fclose(lf);
 		}
+#endif
 	}
 	return ret;
 }
@@ -1160,24 +1355,28 @@ GetPictureAM00FPtr originalGetPicture = nullptr;
 int __stdcall GetPictureInfoHook(LPSTR Buf, long Len, unsigned int Flag, LPVOID Inf)
 {
 	auto ret = originalGetPictureInfo( Buf, Len, Flag, Inf );
+#if UNICODEHACK_PATH_DEBUG
 	{
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, "C:\\tool\\leeyes\\leeyes261\\_path_debug.txt", "a") == 0 && lf )
+		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
 		{
 			fprintf(lf, "GetPictureInfo Buf=[%s] Len=%ld Flag=0x%x ret=%d\n", (Flag & 0x07) ? "<buffer,not-path>" : Buf, Len, Flag, ret);
 			fclose(lf);
 		}
 	}
+#endif
 	if( !(Flag & 0x07) && ret == SPI_FILE_READ_ERROR )
 	{
 		auto retryPath = Utility::GetShortPath( Buf );
 		ret = originalGetPictureInfo( const_cast<LPSTR>(retryPath.c_str() ), Len, Flag, Inf );
+#if UNICODEHACK_PATH_DEBUG
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, "C:\\tool\\leeyes\\leeyes261\\_path_debug.txt", "a") == 0 && lf )
+		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
 		{
 			fprintf(lf, "GetPictureInfo retry=[%s] ret=%d\n", retryPath.c_str(), ret);
 			fclose(lf);
 		}
+#endif
 	}
 	return ret;
 }
@@ -1185,24 +1384,28 @@ int __stdcall GetPictureInfoHook(LPSTR Buf, long Len, unsigned int Flag, LPVOID 
 int __stdcall GetPictureHook(LPSTR Buf, long Len, unsigned int Flag, HANDLE *pHBInfo, HANDLE *pHBm, SPI_PROGRESS PrgressCallback, long Data)
 {
 	auto ret = originalGetPicture( Buf, Len, Flag, pHBInfo, pHBm, PrgressCallback, Data );
+#if UNICODEHACK_PATH_DEBUG
 	{
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, "C:\\tool\\leeyes\\leeyes261\\_path_debug.txt", "a") == 0 && lf )
+		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
 		{
 			fprintf(lf, "GetPicture Buf=[%s] Len=%ld Flag=0x%x ret=%d\n", (Flag & 0x07) ? "<buffer,not-path>" : Buf, Len, Flag, ret);
 			fclose(lf);
 		}
 	}
+#endif
 	if( !(Flag & 0x07) && ret == SPI_FILE_READ_ERROR )
 	{
 		auto retryPath = Utility::GetShortPath( Buf );
 		ret = originalGetPicture( const_cast<LPSTR>(retryPath.c_str() ), Len, Flag, pHBInfo, pHBm, PrgressCallback, Data );
+#if UNICODEHACK_PATH_DEBUG
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, "C:\\tool\\leeyes\\leeyes261\\_path_debug.txt", "a") == 0 && lf )
+		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
 		{
 			fprintf(lf, "GetPicture ansi_in=[%s] retry=[%s] result=%d\n", Buf, retryPath.c_str(), ret);
 			fclose(lf);
 		}
+#endif
 	}
 	return ret;
 }
@@ -1391,6 +1594,7 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 	switch (ul_reason_for_call)
 	{
 	case DLL_PROCESS_ATTACH:
+		gInjectedModule = hModule;
 		// install first, before anything else has a chance to trigger p9np's load
 		Kernel32::hookLoadLibrary();
 		Kernel32::hookLdrLoadDll();
