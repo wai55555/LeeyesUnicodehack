@@ -1,0 +1,8 @@
+[Archive]
+FileName=ax7z.spi
+[Option]
+;0:����	1:�L��
+;���Ƀt�@�C����Z���t�@�C�����ŕ\������A�c���[�̌듮�삪���邪���O�̃\�[�g�ňʒu�������
+HookFindFirstFile=0
+;���d�N��������
+HookCreateMutex=0

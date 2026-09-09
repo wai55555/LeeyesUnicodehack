@@ -1,0 +1,24 @@
+# Visual Studio build output
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+Win32/
+*.vcxproj.user
+*.obj
+*.pdb
+*.ipdb
+*.iobj
+*.pch
+*.log
+*.tlog/
+*.recipe
+*.ilk
+*.exp
+*.lib.recipe
+.vs/
+
+# Anything actually deployed alongside the real (proprietary) Leeyes binary
+# is a local staging copy, not source - never commit it from here.
+/Leeyes/*
+!/Leeyes/README.md
