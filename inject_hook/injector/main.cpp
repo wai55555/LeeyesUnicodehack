@@ -181,73 +181,47 @@ int _tmain(int argc, _TCHAR* argv[])
 				#else
 				std::cout << "DROP_TARGET hwnd=" << hwnd << " title=[" << windowTitle << "] class=[" << windowClass << "]" << std::endl;
 				#endif
-				LPDROPFILES dropfiles=nullptr;
+				LPDROPFILES dropfiles = nullptr;
 				auto length = _tcslen( option );
-				std::string ansiOption;
-				int ansiLength = ::WideCharToMultiByte(932, 0, option, -1, nullptr, 0, "?", nullptr);
 				// Leeyes imports DragQueryFileA, but its drop handler needs the
 				// original Unicode HDROP so the A/W hook pair can recover a CP932
 				// collision such as U+00B7/U+30FB without losing the source path.
-				bool useAnsiDrop = false;
-				if( useAnsiDrop )
-				{
-					ansiOption.resize(ansiLength);
-					if( ::WideCharToMultiByte(932, 0, option, -1, &ansiOption[0], ansiLength, "?", nullptr) <= 0 )
-						useAnsiDrop = false;
-					else if( ansiOption.find('?') != std::string::npos )
-						useAnsiDrop = false;
-				}
-				DWORD payloadBytes = useAnsiDrop
-					? (DWORD)ansiLength + 1
-					: (DWORD)((length + 2) * sizeof(TCHAR));
+				// The injector is a Unicode build, so an ANSI HDROP is never needed.
+				DWORD payloadBytes = (DWORD)((length + 2) * sizeof(TCHAR));
 				DWORD size = sizeof(DROPFILES) + payloadBytes;
-				auto h =::GlobalAlloc( GMEM_MOVEABLE | GMEM_ZEROINIT, size );
+				HGLOBAL h = ::GlobalAlloc( GMEM_MOVEABLE | GMEM_ZEROINIT, size );
+				if( !h ) throw std::exception("GlobalAlloc for HDROP failed");
 				dropfiles = (LPDROPFILES)::GlobalLock( h );
-
-				if( dropfiles )
-				{
-					dropfiles->fWide  = useAnsiDrop ? FALSE : (sizeof(TCHAR) == sizeof(char) ? FALSE : TRUE);
-					dropfiles->fNC = FALSE;
-					dropfiles->pFiles = sizeof(DROPFILES) ;
-					dropfiles->pt = POINT();
-					if( useAnsiDrop )
-					{
-						LPSTR filenamelist = reinterpret_cast<LPSTR>( reinterpret_cast<LPBYTE>( dropfiles) + sizeof(DROPFILES));
-						if( !strcpy_s(filenamelist, ansiLength, ansiOption.c_str()) )
-						{
-							filenamelist[ansiLength] = '\0';
-							::GlobalUnlock( h );
-							BOOL sendResult = ::PostMessage(hwnd, WM_DROPFILES, WPARAM(h), 0);
-							std::cout << "WM_DROPFILES_POST_RESULT=" << sendResult
-								<< " LAST_ERROR=" << GetLastError() << std::endl;
-							if( !sendResult ) throw std::exception("WM_DROPFILES PostMessage failed");
-						}
-						else
-						{
-							throw std::exception("Cant Write ANSI File Name");
-						}
-					}
-					else
-					{
-						LPTSTR filenamelist = reinterpret_cast<LPTSTR>( reinterpret_cast<LPBYTE>( dropfiles) + sizeof(DROPFILES));
-						if(! _tcscpy_s( filenamelist,length+2, option ))
-						{
-							memset(filenamelist + length+1, 0,sizeof(TCHAR) );
-							::GlobalUnlock( h );
-							BOOL sendResult = ::PostMessage(hwnd, WM_DROPFILES, WPARAM(h), 0);
-							std::cout << "WM_DROPFILES_POST_RESULT=" << sendResult
-								<< " LAST_ERROR=" << GetLastError() << std::endl;
-							if( !sendResult ) throw std::exception("WM_DROPFILES PostMessage failed");
-						}
-						else
-						{
-							throw std::exception("Cant Write File Name");
-						}
-					}
-				}
-				else
+				if( !dropfiles )
 				{
 					::GlobalFree( h );
+					throw std::exception("GlobalLock for HDROP failed");
+				}
+
+				dropfiles->fWide = TRUE;
+				dropfiles->fNC = FALSE;
+				dropfiles->pFiles = sizeof(DROPFILES);
+				dropfiles->pt = POINT();
+				LPTSTR filenamelist = reinterpret_cast<LPTSTR>(
+					reinterpret_cast<LPBYTE>(dropfiles) + sizeof(DROPFILES));
+				if( _tcscpy_s(filenamelist, length + 2, option) )
+				{
+					::GlobalUnlock( h );
+					::GlobalFree( h );
+					throw std::exception("Cant Write File Name");
+				}
+				// DROPFILES lists are terminated by two null TCHARs.
+				filenamelist[length + 1] = TEXT('\0');
+				::GlobalUnlock( h );
+				BOOL sendResult = ::PostMessage(hwnd, WM_DROPFILES, WPARAM(h), 0);
+				std::cout << "WM_DROPFILES_POST_RESULT=" << sendResult
+					<< " LAST_ERROR=" << GetLastError() << std::endl;
+				if( !sendResult )
+				{
+					// Ownership transfers to the receiver only when PostMessage
+					// succeeds. On failure the injector must release the HDROP.
+					::GlobalFree( h );
+					throw std::exception("WM_DROPFILES PostMessage failed");
 				}
 			}
 			std::cout << "DLL successfully injected" << std::endl;

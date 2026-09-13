@@ -11,9 +11,11 @@
 #include <mutex>
 #include <csignal>
 #include <exception>
+#include <cctype>
 #include <cstdint>
 #include <atomic>
 #include <map>
+#include <memory>
 #include <winternl.h>
 //#include <concurrent_unordered_set.h>
 //#include <concurrent_unordered_map.h>
@@ -55,9 +57,14 @@ namespace Utility
 	// ANSI Leeyes controls cannot carry every Unicode filename.  Keep a
 	// process-local reverse map for names that lost characters during CP932
 	// conversion so the drawing hook can send the original UTF-16 name to the
-	// Unicode window implementation.  The newest conversion wins because the
-	// same lossy basename can legitimately occur in different directories.
-	std::map<std::string, std::wstring> gLossyDisplayNames;
+	// Unicode window implementation. Conflicting spellings are marked ambiguous
+	// because the same lossy basename can legitimately occur in different directories.
+	struct LossyDisplayValue
+	{
+		std::wstring wide;
+		bool ambiguous = false;
+	};
+	std::map<std::string, LossyDisplayValue> gLossyDisplayNames;
 	std::mutex gLossyDisplayNamesMutex;
 
 	void RememberLossyDisplayName( const std::string& ansi, const std::wstring& wide )
@@ -67,10 +74,24 @@ namespace Utility
 		auto remember = [&]( const std::string& key, const std::wstring& value )
 		{
 			if( key.empty() ) return;
-			// Conversion and drawing are normally adjacent operations. Keep the
-			// newest value so repeated lossy spellings from different directories
-			// do not permanently make the display name unusable.
-			gLossyDisplayNames[key] = value;
+			// A one-byte lossy spelling such as "?" is too ambiguous to use as a
+			// standalone display key: it also occurs in ordinary status/error text.
+			// Full paths remain eligible, and longer names still cover the list
+			// entries for which this map is intended.
+			if( key.find_first_of("\\/") == std::string::npos
+				&& (key.size() < 2 || key.find_first_not_of('?') == std::string::npos) ) return;
+			// Repeated conversions of the same name are harmless. If two different
+			// Unicode names collapse to one ANSI spelling, mark that spelling
+			// ambiguous instead of letting whichever conversion happened last win.
+			auto existing = gLossyDisplayNames.find(key);
+			if( existing == gLossyDisplayNames.end() )
+			{
+				LossyDisplayValue item;
+				item.wide = value;
+				gLossyDisplayNames[key] = item;
+			}
+			else if( existing->second.wide != value )
+				existing->second.ambiguous = true;
 		};
 		remember(ansi, wide);
 		auto slash = ansi.find_last_of("\\/");
@@ -79,33 +100,46 @@ namespace Utility
 			remember(ansi.substr(slash + 1), wide.substr(wideSlash + 1));
 	}
 
-	bool LookupLossyDisplayName( LPCSTR text, int length, std::wstring& wide )
+	bool IsDisplayNameBoundary( unsigned char ch )
+	{
+		return std::isspace(ch) != 0 || strchr("\\/:,;=[](){}<>\"'", ch) != nullptr;
+	}
+
+	bool LookupLossyDisplayName( LPCSTR text, int length, std::wstring& wide,
+		bool allowEmbeddedPath = false )
 	{
 		if( !text ) return false;
 		std::string key(text, length < 0 ? strlen(text) : (size_t)length);
 		std::lock_guard<std::mutex> lock(gLossyDisplayNamesMutex);
 		auto found = gLossyDisplayNames.find(key);
-		if( found != gLossyDisplayNames.end() )
+		if( found != gLossyDisplayNames.end() && !found->second.ambiguous )
 		{
-			wide = found->second;
+			wide = found->second.wide;
 			return true;
 		}
 
-		// Status bars and path captions often prepend a label to the lossy
-		// basename instead of passing the basename as a standalone string.
-		// Replace the longest remembered component and decode the untouched
-		// CP932 pieces normally. This keeps the fix useful outside DrawTextA.
+		// Only path-bearing text may use an embedded replacement.  The previous
+		// unrestricted search could replace an unrelated question mark or status
+		// message with a remembered filename.  Basename keys are exact-match only;
+		// embedded matching is restricted to complete path components.
+		if( !allowEmbeddedPath || key.find_first_of("\\/") == std::string::npos ) return false;
 		size_t bestPos = std::string::npos;
 		size_t bestLength = 0;
 		std::wstring bestValue;
 		for( const auto& candidate : gLossyDisplayNames )
 		{
+			if( candidate.second.ambiguous ) continue;
 			if( candidate.first.size() <= bestLength ) continue;
+			if( candidate.first.find_first_of("\\/") == std::string::npos ) continue;
 			size_t pos = key.find(candidate.first);
 			if( pos == std::string::npos ) continue;
+			bool leftBoundary = pos == 0 || IsDisplayNameBoundary((unsigned char)key[pos - 1]);
+			size_t end = pos + candidate.first.size();
+			bool rightBoundary = end == key.size() || IsDisplayNameBoundary((unsigned char)key[end]);
+			if( !leftBoundary || !rightBoundary ) continue;
 			bestPos = pos;
 			bestLength = candidate.first.size();
-			bestValue = candidate.second;
+			bestValue = candidate.second.wide;
 		}
 		if( bestPos == std::string::npos ) return false;
 
@@ -851,59 +885,65 @@ struct SearchContextEntry
 
 // Normal FindNextFile calls are extremely frequent. Keep the exceptional
 // Unicode-search handles in an atomic side table so the common path does not
-// take a mutex or perform a tree lookup for every JPG/WebP item.
-std::atomic<SearchContextEntry*> gSearchContextEntries[128] = {};
+// take a mutex or perform a tree lookup for every JPG/WebP item. shared_ptr
+// keeps a context alive while a concurrent FindNextFile call is using it;
+// FindClose/EOF can therefore release entries without a use-after-free.
+std::shared_ptr<SearchContextEntry> gSearchContextEntries[128] = {};
 std::atomic<HANDLE> gLastSearchHandle = INVALID_HANDLE_VALUE;
-std::atomic<SearchContextEntry*> gLastSearchEntry = nullptr;
+std::shared_ptr<SearchContextEntry> gLastSearchEntry;
 
 void RememberSearchContext( HANDLE handle, const SearchContext& context )
 {
 	if( handle == INVALID_HANDLE_VALUE ) return;
-	auto* entry = new SearchContextEntry( handle, context );
+	auto entry = std::make_shared<SearchContextEntry>( handle, context );
 	for( auto& slot : gSearchContextEntries )
 	{
-		auto* existing = slot.load();
+		auto existing = std::atomic_load(&slot);
 		if( existing && existing->handle == handle )
 		{
-			slot.store(entry);
-			gLastSearchEntry.store(entry);
+			std::atomic_store(&slot, entry);
+			std::atomic_store(&gLastSearchEntry, entry);
 			gLastSearchHandle.store(handle);
 			return;
 		}
-		SearchContextEntry* empty = nullptr;
-		if( slot.compare_exchange_strong(empty, entry) )
+		std::shared_ptr<SearchContextEntry> empty;
+		if( std::atomic_compare_exchange_strong(&slot, &empty, entry) )
 		{
-			gLastSearchEntry.store(entry);
+			std::atomic_store(&gLastSearchEntry, entry);
 			gLastSearchHandle.store(handle);
 			return;
 		}
 	}
-	delete entry;
 }
 
-SearchContextEntry* FindSearchContext( HANDLE handle )
+std::shared_ptr<SearchContextEntry> FindSearchContext( HANDLE handle )
 {
-	if( gLastSearchHandle.load() != handle ) return nullptr;
-	auto* last = gLastSearchEntry.load();
+	if( gLastSearchHandle.load() != handle ) return std::shared_ptr<SearchContextEntry>();
+	auto last = std::atomic_load(&gLastSearchEntry);
 	if( last && last->handle == handle ) return last;
 	for( auto& slot : gSearchContextEntries )
 	{
-		auto* entry = slot.load();
+		auto entry = std::atomic_load(&slot);
 		if( entry && entry->handle == handle ) return entry;
 	}
-	return nullptr;
+	return std::shared_ptr<SearchContextEntry>();
 }
 
 void ForgetSearchContext( HANDLE handle )
 {
 	for( auto& slot : gSearchContextEntries )
 	{
-		auto* entry = slot.load();
-		if( entry && entry->handle == handle ) slot.compare_exchange_strong(entry, nullptr);
+		auto entry = std::atomic_load(&slot);
+		if( entry && entry->handle == handle )
+		{
+			std::shared_ptr<SearchContextEntry> expected = entry;
+			std::atomic_compare_exchange_strong(&slot, &expected,
+				std::shared_ptr<SearchContextEntry>());
+		}
 	}
 	if( gLastSearchHandle.load() == handle )
 	{
-		gLastSearchEntry.store(nullptr);
+		std::atomic_store(&gLastSearchEntry, std::shared_ptr<SearchContextEntry>());
 		gLastSearchHandle.store(INVALID_HANDLE_VALUE);
 	}
 }
@@ -1190,7 +1230,7 @@ FindNextFileFPtr originalFindNextFile = nullptr;
 
 BOOL  WINAPI FindNextFileHook(HANDLE hFindFile,       LPWIN32_FIND_DATA lpFindFileData   )
 {
-	SearchContextEntry* contextEntry = FindSearchContext( hFindFile );
+	auto contextEntry = FindSearchContext( hFindFile );
 	bool hasContext = contextEntry != nullptr;
 	SearchContext context;
 	if( contextEntry ) context = contextEntry->context;
@@ -1208,6 +1248,10 @@ BOOL  WINAPI FindNextFileHook(HANDLE hFindFile,       LPWIN32_FIND_DATA lpFindFi
 	{
 		FixupFindData( context.parentDirWide, context.parentDirAnsi, lpFindFileData );
 	}
+	DWORD lastError = ret ? ERROR_SUCCESS : ::GetLastError();
+	if( !ret && hasContext && lastError == ERROR_NO_MORE_FILES )
+		ForgetSearchContext( hFindFile );
+	if( !ret ) ::SetLastError(lastError);
 	#if UNICODEHACK_PATH_DEBUG
 	if( ret ) LogFindResult("FindNextFileA", nullptr, lpFindFileData->cFileName);
 	#endif
@@ -1226,6 +1270,24 @@ void hookFindNextFile()
 		fprintf(lf, "hookFindNextFile install %s\n", originalFindNextFile ? "OK" : "FAILED");
 		fclose(lf);
 	}
+}
+
+typedef BOOL (WINAPI *FindCloseFPtr)( HANDLE hFindFile );
+FindCloseFPtr originalFindClose = nullptr;
+
+BOOL WINAPI FindCloseHook( HANDLE hFindFile )
+{
+	// FindClose is the final cleanup point for both the normal A enumeration
+	// and the W enumeration created by the Unicode fallback.
+	ForgetSearchContext( hFindFile );
+	return originalFindClose ? originalFindClose( hFindFile ) : FALSE;
+}
+
+void hookFindClose()
+{
+	originalFindClose = nCodeHook.createHookByName("kernelbase.dll", "FindClose", FindCloseHook);
+	if( !originalFindClose )
+		originalFindClose = nCodeHook.createHookByName("kernel32.dll", "FindClose", FindCloseHook);
 }
 #endif
 
@@ -1918,7 +1980,7 @@ namespace User32
 	int WINAPI DrawTextAHook(HDC dc, LPCSTR text, int length, LPRECT rect, UINT format)
 	{
 		std::wstring wide;
-		bool mapped = text && Utility::LookupLossyDisplayName(text, length, wide);
+		bool mapped = text && Utility::LookupLossyDisplayName(text, length, wide, true);
 		if( mapped )
 		{
 			return ::DrawTextW(dc, wide.c_str(), length < 0 ? -1 : (int)wide.size(), rect, format);
@@ -1928,9 +1990,9 @@ namespace User32
 
 	BOOL WINAPI ExtTextOutAHook(HDC dc, int x, int y, UINT options, const RECT* rect,
 		LPCSTR text, UINT length, const INT* spacing)
-	{
-		std::wstring wide;
-		bool mapped = text && Utility::LookupLossyDisplayName(text, (int)length, wide);
+		{
+			std::wstring wide;
+			bool mapped = text && Utility::LookupLossyDisplayName(text, (int)length, wide, true);
 		if( mapped )
 		{
 			const INT* wideSpacing = (spacing && wide.size() == length) ? spacing : nullptr;
@@ -1940,9 +2002,9 @@ namespace User32
 	}
 
 	BOOL WINAPI TextOutAHook(HDC dc, int x, int y, LPCSTR text, int length)
-	{
-		std::wstring wide;
-		bool mapped = text && Utility::LookupLossyDisplayName(text, length, wide);
+		{
+			std::wstring wide;
+			bool mapped = text && Utility::LookupLossyDisplayName(text, length, wide, true);
 		if( mapped )
 		{
 			return ::TextOutW(dc, x, y, wide.c_str(), (int)wide.size());
@@ -2982,6 +3044,7 @@ void LogPluginPath( const char* api, LPCSTR input, const char* alias,
 		fclose(lf);
 	}
 }
+
 #endif
 
 int __stdcall GetArchiveInfoHook(LPSTR Buf, long Len, unsigned int Flag, HLOCAL *Inf)
@@ -3798,6 +3861,7 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 		{//��������L���ɂ���ƒZ���p�X�ŕ\������邽�ߏ��Ԃ��ς�����茩�h���Ďg���ɂ��������Ƀv���O�C����I�΂Ȃ�
 			Kernel32::hookFindFirstFile();
 			Kernel32::hookFindNextFile();
+			Kernel32::hookFindClose();
 		}
 		{//���Ƀt�@�C���Ή��p
 			Kernel32::hookCreateFileA();
