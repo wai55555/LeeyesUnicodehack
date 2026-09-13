@@ -434,6 +434,95 @@ bool WideToCP932( const std::wstring& path, std::string& result )
 	return true;
 }
 
+// CP932 conversion is lossy: different Unicode characters can produce the same
+// byte spelling, and MultiByteToWideChar() then chooses only one of them.  Use
+// the same best-fit conversion in the opposite direction only while comparing
+// directory entries, so the actual Unicode entry can be recovered when it is
+// the unique match (U+00B7/U+30FB is one example, not a special case).
+bool WideToCP932BestFit( const std::wstring& value, std::string& result )
+{
+	int length = ::WideCharToMultiByte( 932, 0, value.c_str(), -1, nullptr, 0, nullptr, nullptr );
+	if( length <= 0 ) return false;
+	std::vector<char> buffer((size_t)length);
+	if( ::WideCharToMultiByte( 932, 0, value.c_str(), -1, buffer.data(), length, nullptr, nullptr ) <= 0 )
+		return false;
+	result.assign( buffer.data(), (size_t)length - 1 );
+	return true;
+}
+
+// Recover a final path component that was collapsed by an ANSI/CP932
+// conversion.  This is deliberately not part of GetWidePath(): the normal
+// file-list path must remain a single inexpensive conversion.  Archive
+// plug-ins call this only after their original path lookup has failed.
+bool ResolveAnsiPathCollision( const std::string& ansiPath, std::wstring& resolved )
+{
+	// Resolve every component, including parents of image files and search masks.
+	// FindFirstFileW is deliberately used for existence checks: the W attribute
+	// hooks can report success for a repaired spelling without returning that name.
+	int length = ::MultiByteToWideChar(932, 0, ansiPath.c_str(), -1, nullptr, 0);
+	if( length <= 0 ) return false;
+	std::vector<wchar_t> buffer(length);
+	::MultiByteToWideChar(932, 0, ansiPath.c_str(), -1, buffer.data(), length);
+	std::wstring decoded(buffer.data());
+	std::replace(decoded.begin(), decoded.end(), L'/', L'\\');
+	if( decoded.size() < 3 || decoded[1] != L':' || decoded[2] != L'\\' ) return false;
+	std::wstring current = decoded.substr(0, 3);
+	size_t offset = 3;
+	while( offset < decoded.size() )
+	{
+		size_t end = decoded.find(L'\\', offset);
+		if( end == std::wstring::npos ) end = decoded.size();
+		std::wstring leaf = decoded.substr(offset, end - offset);
+		if( leaf.empty() ) { offset = end + 1; continue; }
+		if( current.back() != L'\\' ) current += L'\\';
+		if( leaf.find_first_of(L"*?") != std::wstring::npos )
+		{
+			if( end != decoded.size() ) return false;
+			resolved = current + leaf;
+			return true;
+		}
+		WIN32_FIND_DATAW data = {};
+		HANDLE h = FindFirstFileWLong(current + leaf, &data);
+		if( h != INVALID_HANDLE_VALUE )
+		{
+			::FindClose(h);
+			current += data.cFileName;
+		}
+		else
+		{
+			std::string wanted;
+			if( !WideToCP932BestFit(leaf, wanted) ) return false;
+			h = FindFirstFileWLong(current + L"*", &data);
+			if( h == INVALID_HANDLE_VALUE ) return false;
+			int matches = 0;
+			std::wstring match;
+			do
+			{
+				std::string encoded;
+				if( WideToCP932BestFit(data.cFileName, encoded) && encoded == wanted )
+				{ match = data.cFileName; if( ++matches > 1 ) break; }
+			} while( ::FindNextFileW(h, &data) );
+			::FindClose(h);
+			if( matches != 1 ) return false;
+			current += match;
+		}
+		offset = end + 1;
+	}
+	resolved = current;
+	return true;
+}
+
+// A caller can also pass the already-decoded Unicode spelling to a W API.
+// For a lossy CP932 spelling, re-encode it and recover the unique real
+// directory entry before giving up on the W call.
+bool ResolveWidePathCollision( const std::wstring& widePath, std::wstring& resolved )
+{
+	std::string ansiPath;
+	if( widePath.empty() || !WideToCP932BestFit(widePath, ansiPath) ) return false;
+	if( !ResolveAnsiPathCollision(ansiPath, resolved) ) return false;
+	return resolved != widePath;
+}
+
 bool GetAliasRoot( std::wstring& rootWide, std::string& rootAnsi )
 {
 	static std::mutex rootMutex;
@@ -716,6 +805,21 @@ bool HasPathLengthIssue( const std::string& parentDirAnsi, LPCSTR leafName )
 	return parentDirAnsi.size() + 1 + strlen(leafName) >= MAX_PATH - 1;
 }
 
+#if UNICODEHACK_PATH_DEBUG
+void LogFindResult( const char* api, LPCSTR pattern, LPCSTR name )
+{
+	if( !name || !strstr(name, "neekosan") ) return;
+	FILE* lf = nullptr;
+	if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") != 0 || !lf ) return;
+	fprintf(lf, "%s pattern=[%s] name=[%s] bytes=", api,
+		pattern ? pattern : "<continued>", name);
+	for( const unsigned char* p = reinterpret_cast<const unsigned char*>(name); *p; ++p )
+		fprintf(lf, "%02X", *p);
+	fprintf(lf, "\n");
+	fclose(lf);
+}
+#endif
+
 void ResolveSearchParentDir( SearchContext& context )
 {
 	if( context.parentDirWide.empty() && !context.parentDirAnsi.empty() )
@@ -861,6 +965,32 @@ FindFirstFileFPtr originalFindFirstFile = nullptr;
 HANDLE  WINAPI FindFirstFileHook(LPCTSTR lpFileName,  LPWIN32_FIND_DATA lpFindFileData )
 {
 	HANDLE ret = originalFindFirstFile(lpFileName,lpFindFileData);
+	// A best-fit CP932 spelling can contain no '?' yet name a different Unicode
+	// entry (U+00B7 becomes U+30FB). Delphi also uses FindFirstFile for file
+	// existence/metadata checks before invoking any image/archive plugin.
+	if( ret == INVALID_HANDLE_VALUE && lpFileName && lpFindFileData
+		&& !Utility::HasSyntheticAlias(lpFileName) )
+	{
+		std::wstring realPath;
+		if( Utility::ResolveAnsiPathCollision(lpFileName, realPath) )
+		{
+			WIN32_FIND_DATAW data = {};
+			ret = Utility::FindFirstFileWLong(realPath, &data);
+			if( ret != INVALID_HANDLE_VALUE )
+			{
+				std::string ansi(lpFileName);
+				auto slash = ansi.find_last_of("\\/");
+				CopyFindDataWToA(data, realPath.substr(0, realPath.find_last_of(L"\\/")),
+					ansi.substr(0, slash), lpFindFileData);
+				SearchContext context;
+				context.parentDirAnsi = ansi.substr(0, slash);
+				context.parentDirWide = realPath.substr(0, realPath.find_last_of(L"\\/"));
+				context.wideEnumeration = true;
+				RememberSearchContext(ret, context);
+				return ret;
+			}
+		}
+	}
 	if( ret != INVALID_HANDLE_VALUE ) ForgetSearchContext( ret );
 	bool pathHasUnknown = HasUnknownChar( lpFileName );
 	bool pathHasSynthetic = lpFileName && Utility::HasSyntheticAlias( lpFileName );
@@ -917,6 +1047,9 @@ HANDLE  WINAPI FindFirstFileHook(LPCTSTR lpFileName,  LPWIN32_FIND_DATA lpFindFi
 			if( !context.wideEnumeration && !context.parentDirWide.empty() )
 				FixupFindData( context.parentDirWide, context.parentDirAnsi, lpFindFileData );
 		}
+		#if UNICODEHACK_PATH_DEBUG
+		LogFindResult("FindFirstFileA", lpFileName, lpFindFileData->cFileName);
+		#endif
 	}
 	return ret;
 }
@@ -960,6 +1093,9 @@ BOOL  WINAPI FindNextFileHook(HANDLE hFindFile,       LPWIN32_FIND_DATA lpFindFi
 	{
 		FixupFindData( context.parentDirWide, context.parentDirAnsi, lpFindFileData );
 	}
+	#if UNICODEHACK_PATH_DEBUG
+	if( ret ) LogFindResult("FindNextFileA", nullptr, lpFindFileData->cFileName);
+	#endif
 	return ret;
 }
 void hookFindNextFile()
@@ -1044,6 +1180,12 @@ HANDLE  WINAPI CreateFileAHook(    __in     LPCSTR lpFileName,
 	if( ret == INVALID_HANDLE_VALUE && !wideAttempted )
 	{
 		if( resolvedWide.empty() ) resolvedWide = Utility::GetWidePath( pathForWideResolution );
+		if( resolvedWide.empty() || Utility::GetFileAttributesWLong(resolvedWide) == INVALID_FILE_ATTRIBUTES )
+		{
+			std::wstring collisionPath;
+			if( Utility::ResolveAnsiPathCollision(pathForWideResolution, collisionPath) )
+				resolvedWide = collisionPath;
+		}
 	#if UNICODEHACK_PATH_DEBUG
 		{
 			FILE* lf = nullptr;
@@ -1125,6 +1267,13 @@ HANDLE  WINAPI CreateFileWHook(    __in     LPCWSTR lpFileName,
 		? Utility::CreateFileWLong(resolved, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
 			dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile)
 		: originalCreateFileW(lpFileName,dwDesiredAccess, dwShareMode,lpSecurityAttributes,dwCreationDisposition,dwFlagsAndAttributes  ,hTemplateFile   );
+	if( ret == INVALID_HANDLE_VALUE && lpFileName )
+	{
+		std::wstring collisionPath;
+		if( Utility::ResolveWidePathCollision(lpFileName, collisionPath) )
+			ret = Utility::CreateFileWLong(collisionPath, dwDesiredAccess, dwShareMode,
+				lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+	}
 #if UNICODEHACK_PATH_DEBUG
 	{
 		FILE* lf = nullptr;
@@ -1155,9 +1304,13 @@ GetFileAttributesWFPtr originalGetFileAttributesW = nullptr;
 DWORD WINAPI GetFileAttributesWHook( LPCWSTR lpFileName )
 {
 	std::wstring resolved;
-	if( TryResolveSyntheticWidePath(lpFileName, resolved) )
-		return Utility::GetFileAttributesWLong(resolved);
-	return originalGetFileAttributesW(lpFileName);
+	DWORD ret = TryResolveSyntheticWidePath(lpFileName, resolved)
+		? Utility::GetFileAttributesWLong(resolved)
+		: originalGetFileAttributesW(lpFileName);
+	if( ret == INVALID_FILE_ATTRIBUTES && lpFileName
+		&& Utility::ResolveWidePathCollision(lpFileName, resolved) )
+		ret = Utility::GetFileAttributesWLong(resolved);
+	return ret;
 }
 void hookGetFileAttributesW()
 {
@@ -1169,9 +1322,13 @@ GetFileAttributesExWFPtr originalGetFileAttributesExW = nullptr;
 BOOL WINAPI GetFileAttributesExWHook( LPCWSTR lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId, LPVOID lpFileInformation )
 {
 	std::wstring resolved;
-	if( TryResolveSyntheticWidePath(lpFileName, resolved) )
-		return Utility::GetFileAttributesExWLong(resolved, fInfoLevelId, lpFileInformation);
-	return originalGetFileAttributesExW(lpFileName, fInfoLevelId, lpFileInformation);
+	BOOL ret = TryResolveSyntheticWidePath(lpFileName, resolved)
+		? Utility::GetFileAttributesExWLong(resolved, fInfoLevelId, lpFileInformation)
+		: originalGetFileAttributesExW(lpFileName, fInfoLevelId, lpFileInformation);
+	if( !ret && lpFileName
+		&& Utility::ResolveWidePathCollision(lpFileName, resolved) )
+		ret = Utility::GetFileAttributesExWLong(resolved, fInfoLevelId, lpFileInformation);
+	return ret;
 }
 void hookGetFileAttributesExW()
 {
@@ -1192,6 +1349,10 @@ HANDLE WINAPI CreateFile2Hook(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD d
 		? Utility::CreateFileWLong(resolved, dwDesiredAccess, dwShareMode, nullptr,
 			dwCreationDisposition, 0, nullptr)
 		: originalCreateFile2(lpFileName, dwDesiredAccess, dwShareMode, dwCreationDisposition, pCreateExParams);
+	if( ret == INVALID_HANDLE_VALUE && lpFileName
+		&& Utility::ResolveWidePathCollision(lpFileName, resolved) )
+		ret = Utility::CreateFileWLong(resolved, dwDesiredAccess, dwShareMode, nullptr,
+			dwCreationDisposition, 0, nullptr);
 #if UNICODEHACK_PATH_DEBUG
 	{
 		FILE* lf = nullptr;
@@ -1256,6 +1417,12 @@ DWORD WINAPI GetFileAttributesAHook( LPCSTR lpFileName )
 	if( ret == INVALID_FILE_ATTRIBUTES && !wideAttempted )
 	{
 		if( resolvedWide.empty() ) resolvedWide = Utility::GetWidePath( pathForWideResolution );
+		if( resolvedWide.empty() || Utility::GetFileAttributesWLong(resolvedWide) == INVALID_FILE_ATTRIBUTES )
+		{
+			std::wstring collisionPath;
+			if( Utility::ResolveAnsiPathCollision(pathForWideResolution, collisionPath) )
+				resolvedWide = collisionPath;
+		}
 		ret = Utility::GetFileAttributesWLong( resolvedWide );
 #if UNICODEHACK_PATH_DEBUG
 		FILE* lf = nullptr;
@@ -1316,6 +1483,12 @@ BOOL WINAPI GetFileAttributesExAHook( LPCSTR lpFileName, GET_FILEEX_INFO_LEVELS 
 	if( !ret && !wideAttempted )
 	{
 		if( resolvedWide.empty() ) resolvedWide = Utility::GetWidePath( pathForWideResolution );
+		if( resolvedWide.empty() || Utility::GetFileAttributesWLong(resolvedWide) == INVALID_FILE_ATTRIBUTES )
+		{
+			std::wstring collisionPath;
+			if( Utility::ResolveAnsiPathCollision(pathForWideResolution, collisionPath) )
+				resolvedWide = collisionPath;
+		}
 		ret = Utility::GetFileAttributesExWLong( resolvedWide, fInfoLevelId, lpFileInformation );
 	}
 	return ret;
@@ -1896,25 +2069,174 @@ void hookSHBindToParent()
 	originalSHBindToParent = nCodeHook.createHookByName("shell32.dll", "SHBindToParent", SHBindToParentHook);
 }
 
+typedef UINT  (WINAPI *DragQueryFileWFPtr)(__in HDROP hDrop, __in UINT iFile, __out_ecount_opt(cch) LPWSTR lpszFile, __in UINT cch);
+DragQueryFileWFPtr originalDragQueryFileW = nullptr;
+
+UINT WINAPI DragQueryFileWHook( __in HDROP hDrop, __in UINT iFile, __out_ecount_opt(cch) LPWSTR lpszFile, __in UINT cch )
+{
+	if( iFile == 0xffffffff )
+		return originalDragQueryFileW(hDrop, iFile, lpszFile, cch);
+
+	UINT originalSize = originalDragQueryFileW(hDrop, iFile, lpszFile, cch);
+	#if UNICODEHACK_PATH_DEBUG
+	{
+		FILE* lf = nullptr;
+		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+		{
+			char pathUtf8[MAX_PATH * 2] = {};
+			if( lpszFile ) WideCharToMultiByte(CP_UTF8, 0, lpszFile, -1, pathUtf8, sizeof(pathUtf8), 0, 0);
+			fprintf(lf, "DragQueryFileW call i=%u cch=%u size=%u path=[%s]\n", iFile, cch, originalSize, lpszFile ? pathUtf8 : "<null>");
+			fclose(lf);
+		}
+	}
+	#endif
+	UINT wideSize = originalDragQueryFileW(hDrop, iFile, nullptr, 0);
+	if( !wideSize ) return originalSize;
+
+	std::wstring originalPath(wideSize + 1, L'\0');
+	wideSize = originalDragQueryFileW(hDrop, iFile, const_cast<wchar_t*>(originalPath.data()), (UINT)originalPath.size());
+	if( !wideSize ) return originalSize;
+	originalPath.resize(wideSize);
+
+	std::string ansiPath;
+	std::wstring collisionPath;
+	if( !Utility::WideToCP932BestFit(originalPath, ansiPath)
+		|| !Utility::ResolveAnsiPathCollision(ansiPath, collisionPath)
+		|| collisionPath != originalPath )
+		return originalSize;
+
+	// Return the Unicode spelling produced by CP932 decoding (U+30FB for the
+	// U+00B7 collision). The file hooks map that legacy spelling back to the
+	// unique real entry, while Leeyes no longer retains the unrepresentable
+	// Unicode spelling in its ANSI-oriented path state.
+	std::wstring legacyPath = Utility::GetWidePath(ansiPath);
+	if( legacyPath.empty() || legacyPath == originalPath ) return originalSize;
+
+	#if UNICODEHACK_PATH_DEBUG
+	if( originalPath.find(L"neekosan") != std::wstring::npos )
+	{
+		FILE* lf = nullptr;
+		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+		{
+			char originalUtf8[MAX_PATH * 2] = {};
+			char legacyUtf8[MAX_PATH * 2] = {};
+			WideCharToMultiByte(CP_UTF8, 0, originalPath.c_str(), -1, originalUtf8, sizeof(originalUtf8), 0, 0);
+			WideCharToMultiByte(CP_UTF8, 0, legacyPath.c_str(), -1, legacyUtf8, sizeof(legacyUtf8), 0, 0);
+			fprintf(lf, "DragQueryFileW original=[%s] returned=[%s]\n", originalUtf8, legacyUtf8);
+			fclose(lf);
+		}
+	}
+	#endif
+
+	if( !lpszFile ) return (UINT)legacyPath.size();
+	if( cch == 0 ) return 0;
+	UINT copyLength = (UINT)std::min<size_t>(legacyPath.size(), (size_t)cch - 1);
+	wmemcpy(lpszFile, legacyPath.c_str(), copyLength);
+	lpszFile[copyLength] = L'\0';
+	return copyLength;
+}
+
+void hookDragQueryFileW()
+{
+	originalDragQueryFileW = nCodeHook.createHookByName("shell32.dll", "DragQueryFileW", DragQueryFileWHook);
+	#if UNICODEHACK_PATH_DEBUG
+	FILE* lf = nullptr;
+	if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+	{
+		fprintf(lf, "hookDragQueryFileW install %s\n", originalDragQueryFileW ? "OK" : "FAILED");
+		fclose(lf);
+	}
+	#endif
+}
+
 typedef UINT  (WINAPI *DragQueryFileAFPtr)(__in HDROP hDrop, __in UINT iFile, __out_ecount_opt(cch) LPSTR lpszFile, __in UINT cch);
 DragQueryFileAFPtr originalDragQueryFileA = nullptr;
 
 UINT   WINAPI DragQueryFileAHook( __in HDROP hDrop, __in UINT iFile, __out_ecount_opt(cch) LPSTR lpszFile, __in UINT cch)
 {
 	auto size = originalDragQueryFileA( hDrop, iFile, lpszFile, cch );
+	#if UNICODEHACK_PATH_DEBUG
+	{
+		FILE* lf = nullptr;
+		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+		{
+			fprintf(lf, "DragQueryFileA call i=%u cch=%u size=%u hasBuffer=%s\n",
+				iFile, cch, size, lpszFile ? "yes" : "no");
+			if( lpszFile && strstr(lpszFile, "neekosan") )
+			{
+				fprintf(lf, "DragQueryFileA path=[%s] bytes=", lpszFile);
+				for( const unsigned char* p = reinterpret_cast<const unsigned char*>(lpszFile); *p; ++p )
+					fprintf(lf, "%02X", *p);
+				fprintf(lf, "\n");
+			}
+			fclose(lf);
+		}
+	}
+	#endif
 	if( iFile == 0xffffffff )
 	{
 		return size;
 	}
 	else if( lpszFile )
 	{
-		if(size && memchr(lpszFile, '?' , size) == nullptr )
+		// DragQueryFileA can silently collapse distinct Unicode characters to the
+		// same CP932 bytes (for example U+00B7 and U+30FB).  If that ANSI spelling
+		// does not exist, return a collision-resolvable CP932 spelling backed by
+		// the exact W path so Leeyes stays on the real drive.
+		bool ansiPathMissing = size && size < cch && Kernel32::originalGetFileAttributesA
+			&& Kernel32::originalGetFileAttributesA(lpszFile) == INVALID_FILE_ATTRIBUTES;
+		if(size && memchr(lpszFile, '?' , size) == nullptr && !ansiPathMissing)
 		{
 			return size;
 		}
 		auto wsize = DragQueryFileW( hDrop, iFile,nullptr,0 );
 		std::wstring wstr(  wsize+1, L'\0');
 		size = DragQueryFileW( hDrop, iFile,const_cast<wchar_t*>( wstr.data() ), wstr.size() );
+		if( ansiPathMissing )
+		{
+			std::wstring directCollisionPath;
+			if( Utility::ResolveAnsiPathCollision(lpszFile, directCollisionPath) )
+			{
+				#if UNICODEHACK_PATH_DEBUG
+				FILE* lf = nullptr;
+				if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+				{
+					char wideUtf8[MAX_PATH * 2] = {};
+					WideCharToMultiByte(CP_UTF8, 0, directCollisionPath.c_str(), -1, wideUtf8, sizeof(wideUtf8), 0, 0);
+					fprintf(lf, "DragQueryFileA direct collision=[%s] returned=[%s]\n", wideUtf8, lpszFile);
+					fclose(lf);
+				}
+				#endif
+				return size;
+			}
+
+			auto fullWidePath = MakePath(lpszFile, wstr);
+			std::string safePath;
+			std::wstring collisionPath;
+			if( Utility::WideToCP932BestFit(fullWidePath, safePath)
+				&& Utility::ResolveAnsiPathCollision(safePath, collisionPath)
+				&& collisionPath == fullWidePath )
+			{
+				// Keep the real CP932 spelling. The A-file hooks resolve this
+				// collision back to fullWidePath without exposing a TEMP alias.
+			}
+			else safePath = Utility::GetShortPath(fullWidePath);
+			if( !safePath.empty() && safePath.size() + 1 <= cch )
+			{
+				::strcpy_s(lpszFile, cch, safePath.c_str());
+				#if UNICODEHACK_PATH_DEBUG
+				FILE* lf = nullptr;
+				if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+				{
+					char wideUtf8[MAX_PATH * 2] = {};
+					WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, wideUtf8, sizeof(wideUtf8), 0, 0);
+					fprintf(lf, "DragQueryFileA resolved wide=[%s] returned=[%s]\n", wideUtf8, lpszFile);
+					fclose(lf);
+				}
+				#endif
+				return (UINT)safePath.size();
+			}
+		}
 		return ::WideCharToMultiByte( 932,0, MakePath(lpszFile, wstr).c_str(), -1, lpszFile, cch, 0, 0 );
 	}
 
@@ -1933,6 +2255,14 @@ UINT   WINAPI DragQueryFileAHook( __in HDROP hDrop, __in UINT iFile, __out_ecoun
 void hookDragQueryFileA()
 {
 	originalDragQueryFileA = nCodeHook.createHookByName("shell32.dll", "DragQueryFileA", DragQueryFileAHook);
+	#if UNICODEHACK_PATH_DEBUG
+	FILE* lf = nullptr;
+	if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+	{
+		fprintf(lf, "hookDragQueryFileA install %s\n", originalDragQueryFileA ? "OK" : "FAILED");
+		fclose(lf);
+	}
+	#endif
 }
 
 
@@ -1963,6 +2293,8 @@ SPI_END_OF_FILE,				/* �t�@�C���I�[ (����J�̃G���[
 };
 GetArchiveInfoAM00FPtr originalGetArchiveInfo = nullptr;
 GetFileAM00FPtr originalGetFile = nullptr;
+std::map<std::string, std::wstring> gArchiveWidePathCache;
+std::mutex gArchiveWidePathCacheMutex;
 
 bool NeedsArchivePathAlias( LPCSTR path )
 {
@@ -1973,10 +2305,47 @@ bool NeedsArchivePathAlias( LPCSTR path )
 	return false;
 }
 
+std::wstring GetArchiveWidePath( LPCSTR path )
+{
+	if( !path ) return std::wstring();
+	std::string ansiPath(path);
+	{
+		std::lock_guard<std::mutex> lock(gArchiveWidePathCacheMutex);
+		auto it = gArchiveWidePathCache.find(ansiPath);
+		if( it != gArchiveWidePathCache.end() ) return it->second;
+	}
+
+	std::wstring widePath = Utility::GetWidePath(ansiPath);
+	if( widePath.empty() || Utility::GetFileAttributesWLong(widePath) == INVALID_FILE_ATTRIBUTES )
+	{
+		std::wstring collisionPath;
+		if( Utility::ResolveAnsiPathCollision(ansiPath, collisionPath) )
+			widePath = collisionPath;
+	}
+	if( !widePath.empty() && Utility::GetFileAttributesWLong(widePath) != INVALID_FILE_ATTRIBUTES )
+	{
+		std::lock_guard<std::mutex> lock(gArchiveWidePathCacheMutex);
+		gArchiveWidePathCache[ansiPath] = widePath;
+	}
+	return widePath;
+}
+
 std::string GetArchiveRetryPath( LPCSTR path )
 {
-	if( !path ) return std::string();
-	return Utility::GetArchivePathAlias( Utility::GetWidePath(path) );
+	std::wstring widePath = GetArchiveWidePath(path);
+	if( widePath.empty() ) return std::string();
+
+	// If CP932 gives us a unique real directory entry, keep the plugin on the
+	// user's actual path. The A/W file hooks repair the lossy CP932 spelling at
+	// the filesystem boundary, so no TEMP alias is needed when it is unique.
+	std::string directPath;
+	std::wstring collisionPath;
+	if( Utility::WideToCP932BestFit(widePath, directPath)
+		&& Utility::ResolveAnsiPathCollision(directPath, collisionPath)
+		&& collisionPath == widePath )
+		return directPath;
+
+	return Utility::GetArchivePathAlias( widePath );
 }
 
 struct ZipEntryInfo
@@ -2383,6 +2752,7 @@ int __stdcall GetFileHook(LPSTR Src, long Len, LPSTR Dst, unsigned int Flag, SPI
 // plugins below, so each plugin keeps its own original function pointer.
 enum ArchivePluginFunction
 {
+	ArchivePluginIsSupported,
 	ArchivePluginGetArchiveInfo,
 	ArchivePluginGetFileInfo,
 	ArchivePluginGetFile
@@ -2394,6 +2764,24 @@ struct ArchivePluginCallContext
 	FARPROC original;
 	char moduleName[MAX_PATH];
 };
+
+int __stdcall ArchiveIsSupportedDispatchImpl(ArchivePluginCallContext* context, LPSTR Filename, DWORD Dw)
+{
+	auto original = reinterpret_cast<IsSupportedAM00FPtr>(context->original);
+	int ret = original(Filename, Dw);
+#if UNICODEHACK_PLUGIN_DEBUG
+	const char* moduleLeaf = strrchr(context->moduleName, '\\');
+	moduleLeaf = moduleLeaf ? moduleLeaf + 1 : context->moduleName;
+	if( _stricmp(moduleLeaf, "arc.spi") == 0 )
+	{
+		char detail[96] = {};
+		sprintf_s(detail, "filename_ptr=%p dw=%lu", Filename, (unsigned long)Dw);
+		LogPluginPath("IsSupported", (Dw < 0x10000) ? Filename : nullptr,
+			detail, ret, ret, context->moduleName);
+	}
+#endif
+	return ret;
+}
 
 int __stdcall ArchiveFileInfoDispatchImpl(ArchivePluginCallContext* context, LPSTR Buf,
 	long Len, LPSTR Filename, unsigned int Flag, LPVOID Inf)
@@ -2454,7 +2842,7 @@ int __stdcall ArchiveGetFileDispatchImpl(ArchivePluginCallContext* context, LPST
 	else moduleFileName = context->moduleName;
 	if( needsAlias && _stricmp(moduleFileName, "arc.spi") == 0 && Dst && (Flag & 0x100) )
 	{
-		std::wstring wideArchive = Utility::GetWidePath(Src);
+		std::wstring wideArchive = GetArchiveWidePath(Src);
 		HLOCAL extracted = nullptr;
 		bool extractedOk = ExtractZipEntry(wideArchive, Len, &extracted);
 		if( !extractedOk && Len > 0 ) extractedOk = ExtractZipEntry(wideArchive, Len - 1, &extracted);
@@ -2509,6 +2897,19 @@ int __stdcall ArchiveGetFileDispatchImpl(ArchivePluginCallContext* context, LPST
 	}
 #endif
 	return ret;
+}
+
+__declspec(naked) int __stdcall ArchiveIsSupportedDispatch()
+{
+	__asm
+	{
+		mov edx, esp
+		push dword ptr [edx+8]
+		push dword ptr [edx+4]
+		push eax
+		call ArchiveIsSupportedDispatchImpl
+		ret 8
+	}
 }
 
 __declspec(naked) int __stdcall ArchiveInfoDispatch()
@@ -2581,7 +2982,12 @@ FARPROC WrapArchivePluginFunction(HMODULE hModule, const char* procName, FARPROC
 {
 	void* dispatch = nullptr;
 	ArchivePluginFunction function;
-	if( strcmp(procName, "GetArchiveInfo") == 0 )
+	if( strcmp(procName, "IsSupported") == 0 )
+	{
+		dispatch = reinterpret_cast<void*>(&ArchiveIsSupportedDispatch);
+		function = ArchivePluginIsSupported;
+	}
+	else if( strcmp(procName, "GetArchiveInfo") == 0 )
 	{
 		dispatch = reinterpret_cast<void*>(&ArchiveInfoDispatch);
 		function = ArchivePluginGetArchiveInfo;
@@ -2975,13 +3381,20 @@ FARPROC WINAPI GetProcAddressHook(    _In_ HMODULE hModule,    _In_ LPCSTR lpPro
 			|| strcmp(lpProcName, "GetPicture") == 0);
 		const bool isTargetImagePlugin = isImageProc
 			&& IsTargetImagePlugin( hModule, moduleName, sizeof(moduleName) );
-		const bool isArchiveProc = lpProcName && (strcmp(lpProcName, "GetArchiveInfo") == 0
+		const bool isArchiveEntryProc = lpProcName && (strcmp(lpProcName, "GetArchiveInfo") == 0
 			|| strcmp(lpProcName, "GetFileInfo") == 0
 			|| strcmp(lpProcName, "GetFile") == 0);
 		const char* moduleFileName = strrchr(moduleName, '\\');
 		if( moduleFileName ) ++moduleFileName;
 		else moduleFileName = moduleName;
 		const char* moduleExtension = strrchr(moduleFileName, '.');
+		const bool isKnownArchiveModule = _stricmp(moduleFileName, "arc.spi") == 0
+			|| _stricmp(moduleFileName, "ax7z.spi") == 0
+			|| _stricmp(moduleFileName, "axpdf.spi") == 0
+			|| _stricmp(moduleFileName, "axffmpeg.spi") == 0;
+		const bool isArchiveProbe = lpProcName && strcmp(lpProcName, "IsSupported") == 0
+			&& isKnownArchiveModule;
+		const bool isArchiveProc = isArchiveEntryProc || isArchiveProbe;
 		const bool isArchivePlugin = isArchiveProc && moduleExtension
 			&& _stricmp(moduleExtension, ".spi") == 0;
 #if UNICODEHACK_PLUGIN_DEBUG
@@ -3134,6 +3547,7 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 		{//���d�N��������
 			Kernel32::hookCreateMutexA();
 		}
+		Shell32::hookDragQueryFileW();
 		Shell32::hookDragQueryFileA();
 		break;
 	case DLL_THREAD_ATTACH:
