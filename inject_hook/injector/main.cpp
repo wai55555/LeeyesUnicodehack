@@ -21,7 +21,14 @@ HWND GetWindowHandle(	const DWORD TargetID)
 		DWORD ProcessID;
 		GetWindowThreadProcessId( hWnd, &ProcessID);
 		if(TargetID == ProcessID)
-			return hWnd;
+		{
+			TCHAR className[256] = {};
+			GetClassName(hWnd, className, _countof(className));
+			// Delphi creates several visible top-level windows during startup.  Only
+			// the stable TMainForm owns Leeyes' WM_DROPFILES handler; a splash/helper
+			// window can disappear between discovery and PostMessage.
+			if( _tcscmp(className, TEXT("TMainForm")) == 0 ) return hWnd;
+		}
 	} while((hWnd = GetNextWindow( hWnd, GW_HWNDNEXT)) != NULL);
 
 	return NULL;
@@ -122,52 +129,99 @@ int _tmain(int argc, _TCHAR* argv[])
 
 			if( option )
 			{
-				if( WAIT_TIMEOUT == WaitForInputIdle( pInfo.hProcess, 5000  ))
+				DWORD idleResult = WaitForInputIdle( pInfo.hProcess, 5000 );
+				if( idleResult != 0 && idleResult != WAIT_TIMEOUT )
 				{
-					throw std::exception("WaitForInputIdle return WAIT_TIMEOUT");
+					throw std::exception("WaitForInputIdle failed");
 				}
 				
 				HWND hwnd = NULL;
+				TCHAR windowTitle[256] = {};
+				TCHAR windowClass[256] = {};
 				DWORD count = 0;
-				if( !( hwnd = GetWindowHandle( pInfo.dwProcessId)) )
+				for(;;)
 				{
-					Sleep(20);
-					if( count> 1000 )
+					hwnd = GetWindowHandle( pInfo.dwProcessId);
+					if( hwnd )
+					{
+						GetWindowText(hwnd, windowTitle, _countof(windowTitle));
+						if( windowTitle[0] != TEXT('\0') ) break;
+					}
+					if( count++ > 1000 )
 					{
 						throw std::exception("GetWindowHandle  Time Out");
 					}
-					++count;
+					Sleep(20);
 				}
-				LPDROPFILES dropfiles=nullptr;
-				auto length = _tcslen( option );
-				DWORD size =  sizeof(DROPFILES) + (length+2)*sizeof(TCHAR) ;
-				auto h =::GlobalAlloc( GMEM_SHARE ,size );
-				dropfiles = (LPDROPFILES)::GlobalLock( h );
-
-				if( dropfiles )
+				// TMainForm recreates its HWND while restoring startup state.  A handle
+				// discovered at the first visible/title-bearing moment can therefore be
+				// invalid before WM_DROPFILES reaches the queue.  Require the same live
+				// main-form handle to survive for half a second.
+				HWND stableHwnd = hwnd;
+				DWORD stableCount = 0;
+				DWORD stabilityWait = 0;
+				while( stableCount < 25 )
 				{
-					dropfiles->fWide  = sizeof(TCHAR) ==sizeof(char) ? FALSE:TRUE;
-					dropfiles->fNC = FALSE;
-					dropfiles->pFiles = sizeof(DROPFILES) ;
-					dropfiles->pt = POINT();
-					LPTSTR filenamelist =reinterpret_cast<LPTSTR>( reinterpret_cast<LPBYTE>( dropfiles) +sizeof(DROPFILES));
-			
-					if(! _tcscpy_s( filenamelist,length+2, option ))
-					{
-						memset(filenamelist + length+1, 0,sizeof(TCHAR) );
-						::GlobalUnlock( h );
-						PostMessage(hwnd ,WM_DROPFILES,WPARAM(h),0);
-					}
+					if( stabilityWait++ > 500 )
+						throw std::exception("TMainForm did not stabilize");
+					Sleep(20);
+					HWND candidate = GetWindowHandle( pInfo.dwProcessId );
+					if( candidate && candidate == stableHwnd && IsWindow(candidate) )
+						++stableCount;
 					else
 					{
-						throw std::exception("Cant Write File Name");
-
-						::GlobalUnlock( h );
+						stableHwnd = candidate;
+						stableCount = 0;
 					}
 				}
-				else
+				hwnd = stableHwnd;
+				GetClassName(hwnd, windowClass, _countof(windowClass));
+				#ifdef UNICODE
+				std::wcout << L"DROP_TARGET hwnd=" << hwnd << L" title=[" << windowTitle << L"] class=[" << windowClass << L"]" << std::endl;
+				#else
+				std::cout << "DROP_TARGET hwnd=" << hwnd << " title=[" << windowTitle << "] class=[" << windowClass << "]" << std::endl;
+				#endif
+				LPDROPFILES dropfiles = nullptr;
+				auto length = _tcslen( option );
+				// Leeyes imports DragQueryFileA, but its drop handler needs the
+				// original Unicode HDROP so the A/W hook pair can recover a CP932
+				// collision such as U+00B7/U+30FB without losing the source path.
+				// The injector is a Unicode build, so an ANSI HDROP is never needed.
+				DWORD payloadBytes = (DWORD)((length + 2) * sizeof(TCHAR));
+				DWORD size = sizeof(DROPFILES) + payloadBytes;
+				HGLOBAL h = ::GlobalAlloc( GMEM_MOVEABLE | GMEM_ZEROINIT, size );
+				if( !h ) throw std::exception("GlobalAlloc for HDROP failed");
+				dropfiles = (LPDROPFILES)::GlobalLock( h );
+				if( !dropfiles )
 				{
 					::GlobalFree( h );
+					throw std::exception("GlobalLock for HDROP failed");
+				}
+
+				dropfiles->fWide = TRUE;
+				dropfiles->fNC = FALSE;
+				dropfiles->pFiles = sizeof(DROPFILES);
+				dropfiles->pt = POINT();
+				LPTSTR filenamelist = reinterpret_cast<LPTSTR>(
+					reinterpret_cast<LPBYTE>(dropfiles) + sizeof(DROPFILES));
+				if( _tcscpy_s(filenamelist, length + 2, option) )
+				{
+					::GlobalUnlock( h );
+					::GlobalFree( h );
+					throw std::exception("Cant Write File Name");
+				}
+				// DROPFILES lists are terminated by two null TCHARs.
+				filenamelist[length + 1] = TEXT('\0');
+				::GlobalUnlock( h );
+				BOOL sendResult = ::PostMessage(hwnd, WM_DROPFILES, WPARAM(h), 0);
+				std::cout << "WM_DROPFILES_POST_RESULT=" << sendResult
+					<< " LAST_ERROR=" << GetLastError() << std::endl;
+				if( !sendResult )
+				{
+					// Ownership transfers to the receiver only when PostMessage
+					// succeeds. On failure the injector must release the HDROP.
+					::GlobalFree( h );
+					throw std::exception("WM_DROPFILES PostMessage failed");
 				}
 			}
 			std::cout << "DLL successfully injected" << std::endl;
