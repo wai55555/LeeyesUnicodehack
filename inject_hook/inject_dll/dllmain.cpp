@@ -69,7 +69,7 @@ namespace Utility
 
 	void RememberLossyDisplayName( const std::string& ansi, const std::wstring& wide )
 	{
-		if( ansi.empty() || wide.empty() || ansi.find('?') == std::string::npos ) return;
+		if( ansi.empty() || wide.empty() ) return;
 		std::lock_guard<std::mutex> lock(gLossyDisplayNamesMutex);
 		auto remember = [&]( const std::string& key, const std::wstring& value )
 		{
@@ -166,6 +166,13 @@ namespace Utility
 	bool HasSyntheticAlias( const std::string& path )
 	{
 		return path.find("\\~u") != std::string::npos;
+	}
+
+	bool HasNonAsciiByte( const std::string& value )
+	{
+		for( const unsigned char ch : value )
+			if( ch >= 0x80 ) return true;
+		return false;
 	}
 
 	void RememberSyntheticPathAlias( const std::string& aliasPath, const std::wstring& realPath )
@@ -283,7 +290,7 @@ namespace Utility
 	}
 
 	bool ResolveAnsiPathCollision( const std::string& ansiPath, std::wstring& resolved,
-		bool preserveFinalMask = false );
+		bool preserveFinalMask = false, bool* ambiguous = nullptr );
 	
 std::wstring GetWidePath( std::string Path )
 {
@@ -301,11 +308,23 @@ std::wstring GetWidePath( std::string Path )
 	// A CP932 conversion can turn an actual Unicode name into both '?' and a
 	// best-fit spelling such as U+00B7 -> U+30FB. Resolve those lossy paths
 	// against the real directory entries before the legacy wildcard fallback
-	// can return only a parent directory or the first unrelated match.
+	// can return only a parent directory or the first unrelated match. This is
+	// also done when the decoded spelling happens to exist: it may be the other
+	// member of a best-fit collision.
 	std::wstring collisionPath;
-	if( Path.find('?') != std::string::npos && Path.find('*') == std::string::npos
-		&& ResolveAnsiPathCollision(Path, collisionPath) )
+	if( (Path.find('?') != std::string::npos || HasNonAsciiByte(Path))
+		&& LookupLossyDisplayName(Path.c_str(), -1, collisionPath)
+		&& collisionPath.find_first_of(L"\\/") != std::wstring::npos
+		&& GetFileAttributesWLong(collisionPath) != INVALID_FILE_ATTRIBUTES )
 		return collisionPath;
+	bool collisionAmbiguous = false;
+	if( (Path.find('?') != std::string::npos || HasNonAsciiByte(Path))
+		&& Path.find('*') == std::string::npos )
+	{
+		if( ResolveAnsiPathCollision(Path, collisionPath, false, &collisionAmbiguous) )
+			return collisionPath;
+		if( collisionAmbiguous ) return std::wstring();
+	}
 
 	if( Path.find('?') != std::string::npos )
 	{
@@ -422,11 +441,7 @@ std::wstring GetWidePath( std::string Path )
 			settled_path .append( wide_file_name );
 		}
 	}	
-	bool hasHighByte = false;
-	for( const unsigned char ch : Path )
-	{
-		if( ch >= 0x80 ) { hasHighByte = true; break; }
-	}
+	bool hasHighByte = HasNonAsciiByte(Path);
 	if( hasHighByte && Path.find_first_of("*?") == std::string::npos
 		&& GetFileAttributesWLong(settled_path) == INVALID_FILE_ATTRIBUTES
 		&& ResolveAnsiPathCollision(Path, collisionPath) )
@@ -585,10 +600,13 @@ bool WideToCP932BestFit( const std::wstring& value, std::string& result )
 // Recover path components that were collapsed by an ANSI/CP932 conversion.
 // The normal conversion remains the fast path; this helper is used only for
 // lossy or failed paths. When requested, a final '*' component is preserved
-// as a real search mask instead of being resolved as a filename.
+// as a real search mask instead of being resolved as a filename. A direct W
+// lookup is not sufficient for a best-fit spelling because it may resolve to
+// the other Unicode name that happens to have the same CP932 bytes.
 bool ResolveAnsiPathCollision( const std::string& ansiPath, std::wstring& resolved,
-	bool preserveFinalMask )
+	bool preserveFinalMask, bool* ambiguous )
 {
+	if( ambiguous ) *ambiguous = false;
 	// Resolve every component, including parents of image files and search masks.
 	// FindFirstFileW is deliberately used for existence checks: the W attribute
 	// hooks can report success for a repaired spelling without returning that name.
@@ -600,6 +618,7 @@ bool ResolveAnsiPathCollision( const std::string& ansiPath, std::wstring& resolv
 	std::replace(decoded.begin(), decoded.end(), L'/', L'\\');
 	if( decoded.size() < 3 || decoded[1] != L':' || decoded[2] != L'\\' ) return false;
 	std::wstring current = decoded.substr(0, 3);
+	bool hasNonAsciiByte = HasNonAsciiByte(ansiPath);
 	size_t offset = 3;
 	while( offset < decoded.size() )
 	{
@@ -618,8 +637,13 @@ bool ResolveAnsiPathCollision( const std::string& ansiPath, std::wstring& resolv
 		}
 		WIN32_FIND_DATAW data = {};
 		HANDLE h = INVALID_HANDLE_VALUE;
-		if( !hasQuestion ) h = FindFirstFileWLong(current + leaf, &data);
-		if( h != INVALID_HANDLE_VALUE )
+		bool hasNonAsciiWide = false;
+		for( const wchar_t ch : leaf )
+			if( ch > 0x7F ) { hasNonAsciiWide = true; break; }
+		bool inspectBestFitCollision = hasNonAsciiByte && hasNonAsciiWide;
+		if( !hasQuestion && !inspectBestFitCollision )
+			h = FindFirstFileWLong(current + leaf, &data);
+		if( h != INVALID_HANDLE_VALUE && !inspectBestFitCollision )
 		{
 			::FindClose(h);
 			current += data.cFileName;
@@ -639,7 +663,11 @@ bool ResolveAnsiPathCollision( const std::string& ansiPath, std::wstring& resolv
 				{ match = data.cFileName; if( ++matches > 1 ) break; }
 			} while( ::FindNextFileW(h, &data) );
 			::FindClose(h);
-			if( matches != 1 ) return false;
+			if( matches != 1 )
+			{
+				if( matches > 1 && ambiguous ) *ambiguous = true;
+				return false;
+			}
 			current += match;
 		}
 		offset = end + 1;
@@ -876,12 +904,33 @@ namespace Kernel32
 			for( int i = 0; i < wideLength; ++i )
 				if( input[i] > 0x7F ) { hasNonAscii = true; break; }
 			size_t ansiLength = (size_t)ret - (inputLength < 0 ? 1u : 0u);
-			if( ansiLength > 0 && ansiLength <= (size_t)outputLength
-				&& hasNonAscii && memchr(output, '?', ansiLength) )
+			if( ansiLength > 0 && ansiLength <= (size_t)outputLength && hasNonAscii )
 			{
-				std::string ansi(output, ansiLength);
-				std::wstring wide(input, (size_t)wideLength);
-				Utility::RememberLossyDisplayName(ansi, wide);
+				bool hasReplacement = memchr(output, '?', ansiLength) != nullptr;
+				bool roundTripMismatch = false;
+				int roundTripLength = ::MultiByteToWideChar(932, 0, output,
+					(int)ansiLength, nullptr, 0);
+				if( roundTripLength != wideLength )
+					roundTripMismatch = true;
+				else if( roundTripLength > 0 )
+				{
+					std::vector<wchar_t> roundTrip((size_t)roundTripLength);
+					if( ::MultiByteToWideChar(932, 0, output, (int)ansiLength,
+						roundTrip.data(), roundTripLength) != roundTripLength
+						|| !std::equal(roundTrip.begin(), roundTrip.end(), input) )
+						roundTripMismatch = true;
+				}
+				// '?' is already useful for filenames and paths. Best-fit-only
+				// conversions are remembered only when the input is path-bearing,
+				// avoiding pollution from ordinary UI labels.
+				bool hasPathSeparator = wmemchr(input, L'\\', (size_t)wideLength) != nullptr
+					|| wmemchr(input, L'/', (size_t)wideLength) != nullptr;
+				if( hasReplacement || (roundTripMismatch && hasPathSeparator) )
+				{
+					std::string ansi(output, ansiLength);
+					std::wstring wide(input, (size_t)wideLength);
+					Utility::RememberLossyDisplayName(ansi, wide);
+				}
 			}
 		}
 		inside = false;
@@ -1145,16 +1194,22 @@ FindFirstFileFPtr originalFindFirstFile = nullptr;
 
 HANDLE  WINAPI FindFirstFileHook(LPCTSTR lpFileName,  LPWIN32_FIND_DATA lpFindFileData )
 {
-	HANDLE ret = originalFindFirstFile(lpFileName,lpFindFileData);
 	// A best-fit CP932 spelling can contain no '?' yet name a different Unicode
 	// entry (U+00B7 becomes U+30FB). Delphi also uses FindFirstFile for file
 	// existence/metadata checks before invoking any image/archive plugin.
-	if( ret == INVALID_HANDLE_VALUE && lpFileName && lpFindFileData
+	HANDLE ret = INVALID_HANDLE_VALUE;
+	bool pathHasUnknown = HasUnknownChar( lpFileName );
+	bool pathHasNonAscii = lpFileName && Utility::HasNonAsciiByte( lpFileName );
+	bool pathHasSynthetic = lpFileName && Utility::HasSyntheticAlias(lpFileName);
+	bool shouldResolveCollision = lpFileName && !pathHasSynthetic
+		&& (pathHasUnknown || pathHasNonAscii);
+	if( shouldResolveCollision && lpFindFileData
 		&& !Utility::HasSyntheticAlias(lpFileName) )
 	{
 		std::wstring realPath;
+		bool collisionAmbiguous = false;
 		if( Utility::ResolveAnsiPathCollision(lpFileName, realPath,
-			strchr(lpFileName, '*') != nullptr) )
+			strchr(lpFileName, '*') != nullptr, &collisionAmbiguous) )
 		{
 			WIN32_FIND_DATAW data = {};
 			ret = Utility::FindFirstFileWLong(realPath, &data);
@@ -1172,10 +1227,14 @@ HANDLE  WINAPI FindFirstFileHook(LPCTSTR lpFileName,  LPWIN32_FIND_DATA lpFindFi
 				return ret;
 			}
 		}
+		else if( collisionAmbiguous )
+		{
+			::SetLastError(ERROR_INVALID_NAME);
+			return INVALID_HANDLE_VALUE;
+		}
 	}
+	ret = originalFindFirstFile(lpFileName,lpFindFileData);
 	if( ret != INVALID_HANDLE_VALUE ) ForgetSearchContext( ret );
-	bool pathHasUnknown = HasUnknownChar( lpFileName );
-	bool pathHasSynthetic = lpFileName && Utility::HasSyntheticAlias( lpFileName );
 	bool pathNeedsUnicode = pathHasUnknown || pathHasSynthetic;
 	std::string searchPattern;
 	if( pathNeedsUnicode ) searchPattern = lpFileName;
@@ -1353,11 +1412,12 @@ HANDLE  WINAPI CreateFileAHook(    __in     LPCSTR lpFileName,
 	LPCSTR pathForWideResolution = StripExtendedAnsiPrefix(lpFileName);
 	bool hasExtendedPrefix = IsExtendedAnsiPath(lpFileName);
 	bool hasUnknown = pathForWideResolution && strchr( pathForWideResolution, '?' ) != nullptr;
+	bool hasNonAscii = pathForWideResolution && Utility::HasNonAsciiByte( pathForWideResolution );
 	bool hasSyntheticAlias = pathForWideResolution && Utility::HasSyntheticAlias(pathForWideResolution);
 	std::wstring resolvedWide;
 	bool wideAttempted = false;
 	HANDLE ret = INVALID_HANDLE_VALUE;
-	if( hasUnknown || hasExtendedPrefix || hasSyntheticAlias )
+	if( hasUnknown || hasNonAscii || hasExtendedPrefix || hasSyntheticAlias )
 	{
 		resolvedWide = Utility::GetWidePath( pathForWideResolution );
 		if( !resolvedWide.empty() && resolvedWide.find(L'?') == std::wstring::npos )
@@ -1594,11 +1654,12 @@ DWORD WINAPI GetFileAttributesAHook( LPCSTR lpFileName )
 	LPCSTR pathForWideResolution = StripExtendedAnsiPrefix(lpFileName);
 	bool hasExtendedPrefix = IsExtendedAnsiPath(lpFileName);
 	bool hasUnknown = pathForWideResolution && strchr( pathForWideResolution, '?' ) != nullptr;
+	bool hasNonAscii = pathForWideResolution && Utility::HasNonAsciiByte( pathForWideResolution );
 	bool hasSyntheticAlias = pathForWideResolution && Utility::HasSyntheticAlias(pathForWideResolution);
 	std::wstring resolvedWide;
 	bool wideAttempted = false;
 	DWORD ret = INVALID_FILE_ATTRIBUTES;
-	if( hasUnknown || hasExtendedPrefix || hasSyntheticAlias )
+	if( hasUnknown || hasNonAscii || hasExtendedPrefix || hasSyntheticAlias )
 	{
 		resolvedWide = Utility::GetWidePath( pathForWideResolution );
 		if( !resolvedWide.empty() && resolvedWide.find(L'?') == std::wstring::npos )
@@ -1660,11 +1721,12 @@ BOOL WINAPI GetFileAttributesExAHook( LPCSTR lpFileName, GET_FILEEX_INFO_LEVELS 
 	LPCSTR pathForWideResolution = StripExtendedAnsiPrefix(lpFileName);
 	bool hasExtendedPrefix = IsExtendedAnsiPath(lpFileName);
 	bool hasUnknown = pathForWideResolution && strchr( pathForWideResolution, '?' ) != nullptr;
+	bool hasNonAscii = pathForWideResolution && Utility::HasNonAsciiByte( pathForWideResolution );
 	bool hasSyntheticAlias = pathForWideResolution && Utility::HasSyntheticAlias(pathForWideResolution);
 	std::wstring resolvedWide;
 	bool wideAttempted = false;
 	BOOL ret = FALSE;
-	if( hasUnknown || hasExtendedPrefix || hasSyntheticAlias )
+	if( hasUnknown || hasNonAscii || hasExtendedPrefix || hasSyntheticAlias )
 	{
 		resolvedWide = Utility::GetWidePath( pathForWideResolution );
 		if( !resolvedWide.empty() && resolvedWide.find(L'?') == std::wstring::npos )
@@ -1721,7 +1783,9 @@ void hookGetFileAttributesExA()
 			&& wide.find(L'?') == std::wstring::npos
 			&& (!mustExist || Utility::GetFileAttributesWLong(wide) != INVALID_FILE_ATTRIBUTES) )
 			return true;
-		if( !hasLossyName && !Utility::HasSyntheticAlias(ansi) && ansi.find('?') == std::string::npos )
+		if( !hasLossyName && !Utility::HasSyntheticAlias(ansi)
+			&& ansi.find('?') == std::string::npos
+			&& !Utility::HasNonAsciiByte(ansi) )
 		{
 			wide = Utility::GetWidePath(ansi);
 			return false;
