@@ -14,6 +14,7 @@
 #include <cctype>
 #include <cstdint>
 #include <atomic>
+#include <limits>
 #include <map>
 #include <memory>
 #include <winternl.h>
@@ -106,23 +107,28 @@ namespace Utility
 	}
 
 	bool LookupLossyDisplayName( LPCSTR text, int length, std::wstring& wide,
-		bool allowEmbeddedPath = false )
+		bool allowEmbeddedPath = false, bool allowEmbeddedName = false )
 	{
 		if( !text ) return false;
 		std::string key(text, length < 0 ? strlen(text) : (size_t)length);
 		std::lock_guard<std::mutex> lock(gLossyDisplayNamesMutex);
 		auto found = gLossyDisplayNames.find(key);
-		if( found != gLossyDisplayNames.end() && !found->second.ambiguous )
+		if( found != gLossyDisplayNames.end() )
 		{
-			wide = found->second.wide;
-			return true;
+			if( !found->second.ambiguous )
+			{
+				wide = found->second.wide;
+				return true;
+			}
 		}
 
-		// Only path-bearing text may use an embedded replacement.  The previous
-		// unrestricted search could replace an unrelated question mark or status
-		// message with a remembered filename.  Basename keys are exact-match only;
-		// embedded matching is restricted to complete path components.
-		if( !allowEmbeddedPath || key.find_first_of("\\/") == std::string::npos ) return false;
+		// Embedded replacement is opt-in because an arbitrary question mark or
+		// status string must never become a remembered filename. Path-bearing
+		// text uses complete path components; window captions and edit controls
+		// may instead contain a lossy basename between punctuation/whitespace.
+		if( (!allowEmbeddedPath && !allowEmbeddedName)
+			|| (!allowEmbeddedPath && key.find_first_of("\\/") != std::string::npos) )
+			return false;
 		size_t bestPos = std::string::npos;
 		size_t bestLength = 0;
 		std::wstring bestValue;
@@ -130,7 +136,8 @@ namespace Utility
 		{
 			if( candidate.second.ambiguous ) continue;
 			if( candidate.first.size() <= bestLength ) continue;
-			if( candidate.first.find_first_of("\\/") == std::string::npos ) continue;
+			bool candidateHasPath = candidate.first.find_first_of("\\/") != std::string::npos;
+			if( candidateHasPath ? !allowEmbeddedPath : !allowEmbeddedName ) continue;
 			size_t pos = key.find(candidate.first);
 			if( pos == std::string::npos ) continue;
 			bool leftBoundary = pos == 0 || IsDisplayNameBoundary((unsigned char)key[pos - 1]);
@@ -163,6 +170,25 @@ namespace Utility
 		return true;
 	}
 
+	// Some controls keep the CP932 result in a Unicode window/control and later
+	// draw it through the W GDI entry points. Convert that already-damaged W
+	// string back to the same ANSI key used by the enumeration map before the
+	// lossy spelling is rendered.
+	bool LookupLossyDisplayNameW( LPCWSTR text, int length, std::wstring& wide,
+		bool allowEmbeddedPath = false, bool allowEmbeddedName = false )
+	{
+		if( !text ) return false;
+		int wideLength = length < 0 ? (int)wcslen(text) : length;
+		if( wideLength <= 0 ) return false;
+		int ansiLength = ::WideCharToMultiByte(932, 0, text, wideLength,
+			nullptr, 0, nullptr, nullptr);
+		if( ansiLength <= 0 ) return false;
+		std::string ansi((size_t)ansiLength, '\0');
+		if( ::WideCharToMultiByte(932, 0, text, wideLength, &ansi[0], ansiLength,
+			nullptr, nullptr) != ansiLength ) return false;
+		return LookupLossyDisplayName(ansi.data(), ansiLength, wide, allowEmbeddedPath, allowEmbeddedName);
+	}
+
 	bool HasSyntheticAlias( const std::string& path )
 	{
 		return path.find("\\~u") != std::string::npos;
@@ -172,6 +198,13 @@ namespace Utility
 	{
 		for( const unsigned char ch : value )
 			if( ch >= 0x80 ) return true;
+		return false;
+	}
+
+	bool HasNonAsciiWide( const std::wstring& value )
+	{
+		for( const wchar_t ch : value )
+			if( ch > 0x7F ) return true;
 		return false;
 	}
 
@@ -615,11 +648,59 @@ bool ResolveAnsiPathCollision( const std::string& ansiPath, std::wstring& resolv
 	std::vector<wchar_t> buffer(length);
 	::MultiByteToWideChar(932, 0, ansiPath.c_str(), -1, buffer.data(), length);
 	std::wstring decoded(buffer.data());
+	if( decoded.compare(0, 8, L"\\\\?\\UNC\\") == 0 )
+		decoded = L"\\\\" + decoded.substr(8);
+	else if( decoded.compare(0, 4, L"\\\\?\\") == 0 )
+		decoded.erase(0, 4);
 	std::replace(decoded.begin(), decoded.end(), L'/', L'\\');
-	if( decoded.size() < 3 || decoded[1] != L':' || decoded[2] != L'\\' ) return false;
-	std::wstring current = decoded.substr(0, 3);
+	bool driveRooted = decoded.size() >= 3 && decoded[1] == L':' && decoded[2] == L'\\';
+	bool uncRooted = decoded.compare(0, 2, L"\\\\") == 0;
+	if( !driveRooted && !uncRooted )
+	{
+		// ANSI callers sometimes pass a relative filename. Make it absolute
+		// before resolving components so a Unicode current directory is handled
+		// by the same collision logic as an absolute path.
+		std::vector<wchar_t> absolute(MAX_PATH);
+		DWORD absoluteLength = ::GetFullPathNameW(decoded.c_str(),
+			(DWORD)absolute.size(), absolute.data(), nullptr);
+		if( absoluteLength == 0 ) return false;
+		if( absoluteLength >= absolute.size() )
+		{
+			absolute.assign((size_t)absoluteLength + 1, L'\0');
+			absoluteLength = ::GetFullPathNameW(decoded.c_str(),
+				(DWORD)absolute.size(), absolute.data(), nullptr);
+			if( absoluteLength == 0 || absoluteLength >= absolute.size() ) return false;
+		}
+		decoded.assign(absolute.data(), absoluteLength);
+		std::replace(decoded.begin(), decoded.end(), L'/', L'\\');
+		driveRooted = decoded.size() >= 3 && decoded[1] == L':' && decoded[2] == L'\\';
+		uncRooted = decoded.compare(0, 2, L"\\\\") == 0;
+	}
+	std::wstring current;
+	size_t offset = 0;
+	if( driveRooted )
+	{
+		current = decoded.substr(0, 3);
+		offset = 3;
+	}
+	else if( uncRooted )
+	{
+		// Resolve a UNC root as \\server\share, then resolve the remaining
+		// components one at a time. The server/share names themselves cannot be
+		// looked up as ordinary child entries.
+		auto serverEnd = decoded.find(L'\\', 2);
+		if( serverEnd == std::wstring::npos || serverEnd == 2 ) return false;
+		auto shareEnd = decoded.find(L'\\', serverEnd + 1);
+		if( shareEnd == std::wstring::npos || shareEnd == serverEnd + 1 )
+		{
+			current = decoded;
+			return true;
+		}
+		current = decoded.substr(0, shareEnd);
+		offset = shareEnd + 1;
+	}
+	else return false;
 	bool hasNonAsciiByte = HasNonAsciiByte(ansiPath);
-	size_t offset = 3;
 	while( offset < decoded.size() )
 	{
 		size_t end = decoded.find(L'\\', offset);
@@ -674,6 +755,14 @@ bool ResolveAnsiPathCollision( const std::string& ansiPath, std::wstring& resolv
 	}
 	resolved = current;
 	return true;
+}
+
+bool IsAnsiPathCollisionAmbiguous( const std::string& ansiPath )
+{
+	std::wstring ignored;
+	bool ambiguous = false;
+	ResolveAnsiPathCollision( ansiPath, ignored, false, &ambiguous );
+	return ambiguous;
 }
 
 // A caller can also pass the already-decoded Unicode spelling to a W API.
@@ -923,9 +1012,14 @@ namespace Kernel32
 				// '?' is already useful for filenames and paths. Best-fit-only
 				// conversions are remembered only when the input is path-bearing,
 				// avoiding pollution from ordinary UI labels.
+				// A '?' in the UTF-16 input means the string was already damaged by
+				// an earlier ANSI conversion; remembering it would turn the real
+				// filename and its decoded fallback into a false ambiguity.
 				bool hasPathSeparator = wmemchr(input, L'\\', (size_t)wideLength) != nullptr
 					|| wmemchr(input, L'/', (size_t)wideLength) != nullptr;
-				if( hasReplacement || (roundTripMismatch && hasPathSeparator) )
+				bool inputAlreadyDamaged = wmemchr(input, L'?', (size_t)wideLength) != nullptr;
+				if( !inputAlreadyDamaged
+					&& (hasReplacement || (roundTripMismatch && hasPathSeparator)) )
 				{
 					std::string ansi(output, ansiLength);
 					std::wstring wide(input, (size_t)wideLength);
@@ -1114,27 +1208,61 @@ bool CopyFindDataWToA( const WIN32_FIND_DATAW& source, const std::wstring& paren
 	::WideCharToMultiByte( 932, 0, source.cFileName, -1,
 		fileName, sizeof(fileName), 0, 0 );
 
+	// Keep both the ANSI spelling used by Leeyes and the original UTF-16 leaf.
+	// This is needed even when the conversion contains no '?': CP932 best-fit
+	// conversion can turn U+00B7 into U+30FB while still producing a valid name.
+	if( Utility::HasNonAsciiWide(source.cFileName) )
+	{
+		std::string bestFitName;
+		if( Utility::WideToCP932BestFit(source.cFileName, bestFitName) )
+		{
+			Utility::RememberLossyDisplayName(bestFitName, source.cFileName);
+		}
+	}
+
+	std::wstring fullWide;
+	bool bestFitCollision = false;
+	if( !parentDirWide.empty() )
+	{
+		fullWide = parentDirWide + L"\\" + source.cFileName;
+		if( Utility::HasNonAsciiWide(fullWide) )
+		{
+			std::string fullBestFit;
+			if( Utility::WideToCP932BestFit(fullWide, fullBestFit) )
+			{
+				Utility::RememberLossyDisplayName(fullBestFit, fullWide);
+				std::wstring ignored;
+				bool ambiguous = false;
+				Utility::ResolveAnsiPathCollision(fullBestFit, ignored, false, &ambiguous);
+				bestFitCollision = ambiguous;
+			}
+		}
+	}
+
 	// '?' is not legal in a Windows filename, so one in the CP932 result means
 	// that the name was not representable. Also replace a representable leaf
 	// when the complete ANSI path would exceed Leeyes' MAX_PATH-sized buffers.
 	// The latter is what makes long ASCII filenames work inside a Unicode folder.
 	bool needsAlias = strchr(fileName, '?') != nullptr
-		|| HasPathLengthIssue(parentDirAnsi, fileName);
+		|| HasPathLengthIssue(parentDirAnsi, fileName)
+		|| bestFitCollision;
 	if( needsAlias && !parentDirWide.empty() )
 	{
 		if( alternateName[0] && !strchr(fileName, '?') )
 		{
 			strncpy_s( fileName, sizeof(fileName), alternateName, _TRUNCATE );
+			Utility::RememberLossyDisplayName(fileName, source.cFileName);
 		}
 		else
 		{
-			std::wstring fullWide = parentDirWide + L"\\" + source.cFileName;
 			auto alias = Utility::GetOrCreateAsciiAlias( fullWide, parentDirAnsi );
 			if( !alias.empty() )
 			{
 				auto slashPos = alias.find_last_of( '\\' );
 				auto leafOnly = slashPos == std::string::npos ? alias : alias.substr( slashPos + 1 );
 				strncpy_s( fileName, sizeof(fileName), leafOnly.c_str(), _TRUNCATE );
+				Utility::RememberLossyDisplayName(fileName, source.cFileName);
+				Utility::RememberLossyDisplayName(alias, fullWide);
 			}
 		}
 	}
@@ -1160,16 +1288,11 @@ void FixupFindData( const std::wstring& parentDirWide, const std::string& parent
 	bool pathTooLong = HasPathLengthIssue(parentDirAnsi, lpFindFileData->cFileName);
 	if( !hasUnknown && !pathTooLong ) return;
 
-	if( lpFindFileData->cAlternateFileName[0] )
-	{
-		::strncpy_s(lpFindFileData->cFileName,lpFindFileData->cAlternateFileName ,14);
-		return;
-	}
-
 	if( parentDirWide.empty() ) return;
 
 	// cFileName's '?' characters are already valid single-character wildcards for
 	// FindFirstFileW; everything else just needs converting back to its real wide form.
+	std::string damagedName = lpFindFileData->cFileName;
 	wchar_t widePattern[MAX_PATH] = {};
 	if( !::MultiByteToWideChar( 932, 0, lpFindFileData->cFileName, -1, widePattern, MAX_PATH ) ) return;
 
@@ -1180,12 +1303,38 @@ void FixupFindData( const std::wstring& parentDirWide, const std::string& parent
 	::FindClose( hFind );
 
 	std::wstring fullWide = parentDirWide + L"\\" + wideFindData.cFileName;
+	if( hasUnknown )
+	{
+		// The original ANSI enumeration has already lost information in cFileName.
+		// Preserve that exact spelling as a display key before replacing it with an
+		// access-safe alternate/alias. FindNextFile repeats this for every matching
+		// entry, so genuine collisions remain marked ambiguous.
+		Utility::RememberLossyDisplayName(damagedName, wideFindData.cFileName);
+		std::string bestFitName;
+		if( Utility::WideToCP932BestFit(wideFindData.cFileName, bestFitName) )
+			Utility::RememberLossyDisplayName(bestFitName, wideFindData.cFileName);
+		std::string fullBestFit;
+		if( Utility::WideToCP932BestFit(fullWide, fullBestFit) )
+			Utility::RememberLossyDisplayName(fullBestFit, fullWide);
+	}
+
+	if( lpFindFileData->cAlternateFileName[0] )
+	{
+		if( hasUnknown )
+			Utility::RememberLossyDisplayName(lpFindFileData->cAlternateFileName,
+				wideFindData.cFileName);
+		::strncpy_s(lpFindFileData->cFileName,lpFindFileData->cAlternateFileName ,14);
+		return;
+	}
+
 	auto alias = Utility::GetOrCreateAsciiAlias( fullWide, parentDirAnsi );
 	if( !alias.empty() )
 	{
 		auto slashPos = alias.find_last_of( '\\' );
 		auto leafOnly = slashPos == std::string::npos ? alias : alias.substr( slashPos + 1 );
 		::strncpy_s(lpFindFileData->cFileName, leafOnly.c_str(), leafOnly.size());
+		if( hasUnknown )
+			Utility::RememberLossyDisplayName(leafOnly, wideFindData.cFileName);
 	}
 }
 
@@ -1201,8 +1350,9 @@ HANDLE  WINAPI FindFirstFileHook(LPCTSTR lpFileName,  LPWIN32_FIND_DATA lpFindFi
 	bool pathHasUnknown = HasUnknownChar( lpFileName );
 	bool pathHasNonAscii = lpFileName && Utility::HasNonAsciiByte( lpFileName );
 	bool pathHasSynthetic = lpFileName && Utility::HasSyntheticAlias(lpFileName);
+	bool pathHasSearchMask = lpFileName && strchr(lpFileName, '*') != nullptr;
 	bool shouldResolveCollision = lpFileName && !pathHasSynthetic
-		&& (pathHasUnknown || pathHasNonAscii);
+		&& (pathHasUnknown || pathHasNonAscii || pathHasSearchMask);
 	if( shouldResolveCollision && lpFindFileData
 		&& !Utility::HasSyntheticAlias(lpFileName) )
 	{
@@ -1429,6 +1579,12 @@ HANDLE  WINAPI CreateFileAHook(    __in     LPCSTR lpFileName,
 	}
 	if( !wideAttempted )
 	{
+		if( (hasUnknown || hasNonAscii) && resolvedWide.empty()
+			&& Utility::IsAnsiPathCollisionAmbiguous(pathForWideResolution) )
+		{
+			::SetLastError(ERROR_INVALID_NAME);
+			return INVALID_HANDLE_VALUE;
+		}
 		ret = originalCreateFileA(lpFileName,dwDesiredAccess, dwShareMode,lpSecurityAttributes,dwCreationDisposition,dwFlagsAndAttributes  ,hTemplateFile   );
 	}
 #if UNICODEHACK_PATH_DEBUG
@@ -1668,7 +1824,16 @@ DWORD WINAPI GetFileAttributesAHook( LPCSTR lpFileName )
 			wideAttempted = true;
 		}
 	}
-	if( !wideAttempted ) ret = originalGetFileAttributesA( lpFileName );
+	if( !wideAttempted )
+	{
+		if( (hasUnknown || hasNonAscii) && resolvedWide.empty()
+			&& Utility::IsAnsiPathCollisionAmbiguous(pathForWideResolution) )
+		{
+			::SetLastError(ERROR_INVALID_NAME);
+			return INVALID_FILE_ATTRIBUTES;
+		}
+		ret = originalGetFileAttributesA( lpFileName );
+	}
 #if UNICODEHACK_PATH_DEBUG
 	{
 		FILE* lf = nullptr;
@@ -1735,7 +1900,16 @@ BOOL WINAPI GetFileAttributesExAHook( LPCSTR lpFileName, GET_FILEEX_INFO_LEVELS 
 			wideAttempted = true;
 		}
 	}
-	if( !wideAttempted ) ret = originalGetFileAttributesExA( lpFileName, fInfoLevelId, lpFileInformation );
+	if( !wideAttempted )
+	{
+		if( (hasUnknown || hasNonAscii) && resolvedWide.empty()
+			&& Utility::IsAnsiPathCollisionAmbiguous(pathForWideResolution) )
+		{
+			::SetLastError(ERROR_INVALID_NAME);
+			return FALSE;
+		}
+		ret = originalGetFileAttributesExA( lpFileName, fInfoLevelId, lpFileInformation );
+	}
 #if UNICODEHACK_PATH_DEBUG
 	{
 		FILE* lf = nullptr;
@@ -1773,8 +1947,10 @@ void hookGetFileAttributesExA()
 	// Leeyes keeps file-list entries in ANSI form.  Entries that cannot be
 	// represented in CP932 are given a process-local ASCII alias by the
 	// enumeration hooks, so file operations must resolve that alias too.
-	bool ResolveAnsiOperationPath( LPCSTR input, bool mustExist, std::wstring& wide )
+	bool ResolveAnsiOperationPath( LPCSTR input, bool mustExist, std::wstring& wide,
+		bool* blocked = nullptr )
 	{
+		if( blocked ) *blocked = false;
 		if( !input || !*input ) return false;
 		std::string ansi(input);
 		if( Utility::LookupSyntheticPathAlias(ansi, wide) ) return true;
@@ -1795,7 +1971,14 @@ void hookGetFileAttributesExA()
 		if( wide.empty() || wide.find(L'?') != std::wstring::npos )
 		{
 			std::wstring collision;
-			if( Utility::ResolveAnsiPathCollision(ansi, collision) ) wide.swap(collision);
+			bool collisionAmbiguous = false;
+			if( Utility::ResolveAnsiPathCollision(ansi, collision, false, &collisionAmbiguous) )
+				wide.swap(collision);
+			else if( collisionAmbiguous )
+			{
+				if( blocked ) *blocked = true;
+				return false;
+			}
 		}
 		return !wide.empty() && wide.find(L'?') == std::wstring::npos
 			&& (!mustExist || Utility::GetFileAttributesWLong(wide) != INVALID_FILE_ATTRIBUTES);
@@ -1813,8 +1996,14 @@ void hookGetFileAttributesExA()
 	BOOL WINAPI MoveFileAHook(LPCSTR existingName, LPCSTR newName)
 	{
 		std::wstring existingWide, newWide;
-		bool sourceResolved = ResolveAnsiOperationPath(existingName, true, existingWide);
-		bool destinationResolved = ResolveAnsiOperationPath(newName, false, newWide);
+		bool sourceBlocked = false, destinationBlocked = false;
+		bool sourceResolved = ResolveAnsiOperationPath(existingName, true, existingWide, &sourceBlocked);
+		bool destinationResolved = ResolveAnsiOperationPath(newName, false, newWide, &destinationBlocked);
+		if( sourceBlocked || destinationBlocked )
+		{
+			::SetLastError(ERROR_INVALID_NAME);
+			return FALSE;
+		}
 		if( sourceResolved || destinationResolved )
 		{
 			if( existingWide.empty() ) existingWide = Utility::GetWidePath(existingName ? existingName : "");
@@ -1830,8 +2019,14 @@ void hookGetFileAttributesExA()
 	BOOL WINAPI MoveFileExAHook(LPCSTR existingName, LPCSTR newName, DWORD flags)
 	{
 		std::wstring existingWide, newWide;
-		bool sourceResolved = ResolveAnsiOperationPath(existingName, true, existingWide);
-		bool destinationResolved = ResolveAnsiOperationPath(newName, false, newWide);
+		bool sourceBlocked = false, destinationBlocked = false;
+		bool sourceResolved = ResolveAnsiOperationPath(existingName, true, existingWide, &sourceBlocked);
+		bool destinationResolved = ResolveAnsiOperationPath(newName, false, newWide, &destinationBlocked);
+		if( sourceBlocked || destinationBlocked )
+		{
+			::SetLastError(ERROR_INVALID_NAME);
+			return FALSE;
+		}
 		if( sourceResolved || destinationResolved )
 		{
 			if( existingWide.empty() ) existingWide = Utility::GetWidePath(existingName ? existingName : "");
@@ -1847,16 +2042,20 @@ void hookGetFileAttributesExA()
 	BOOL WINAPI DeleteFileAHook(LPCSTR fileName)
 	{
 		std::wstring wide;
-		if( ResolveAnsiOperationPath(fileName, true, wide) )
+		bool blocked = false;
+		if( ResolveAnsiOperationPath(fileName, true, wide, &blocked) )
 			return ::DeleteFileW(wide.c_str());
+		if( blocked ) { ::SetLastError(ERROR_INVALID_NAME); return FALSE; }
 		return originalDeleteFileA ? originalDeleteFileA(fileName) : FALSE;
 	}
 
 	BOOL WINAPI RemoveDirectoryAHook(LPCSTR path)
 	{
 		std::wstring wide;
-		if( ResolveAnsiOperationPath(path, true, wide) )
+		bool blocked = false;
+		if( ResolveAnsiOperationPath(path, true, wide, &blocked) )
 			return ::RemoveDirectoryW(wide.c_str());
+		if( blocked ) { ::SetLastError(ERROR_INVALID_NAME); return FALSE; }
 		return originalRemoveDirectoryA ? originalRemoveDirectoryA(path) : FALSE;
 	}
 
@@ -2065,13 +2264,20 @@ namespace User32
 	bool IsTextMessage( UINT message );
 
 	int (WINAPI *originalDrawTextA)(HDC, LPCSTR, int, LPRECT, UINT) = nullptr;
+	int (WINAPI *originalDrawTextW)(HDC, LPCWSTR, int, LPRECT, UINT) = nullptr;
+	int (WINAPI *originalDrawTextExA)(HDC, LPCSTR, int, LPRECT, UINT, LPDRAWTEXTPARAMS) = nullptr;
+	int (WINAPI *originalDrawTextExW)(HDC, LPCWSTR, int, LPRECT, UINT, LPDRAWTEXTPARAMS) = nullptr;
+	LONG (WINAPI *originalTabbedTextOutA)(HDC, int, int, LPCSTR, int, int, const INT*, int) = nullptr;
+	LONG (WINAPI *originalTabbedTextOutW)(HDC, int, int, LPCWSTR, int, int, const INT*, int) = nullptr;
 	BOOL (WINAPI *originalExtTextOutA)(HDC, int, int, UINT, const RECT*, LPCSTR, UINT, const INT*) = nullptr;
+	BOOL (WINAPI *originalExtTextOutW)(HDC, int, int, UINT, const RECT*, LPCWSTR, UINT, const INT*) = nullptr;
 	BOOL (WINAPI *originalTextOutA)(HDC, int, int, LPCSTR, int) = nullptr;
+	BOOL (WINAPI *originalTextOutW)(HDC, int, int, LPCWSTR, int) = nullptr;
 
 	int WINAPI DrawTextAHook(HDC dc, LPCSTR text, int length, LPRECT rect, UINT format)
 	{
 		std::wstring wide;
-		bool mapped = text && Utility::LookupLossyDisplayName(text, length, wide, true);
+		bool mapped = text && Utility::LookupLossyDisplayName(text, length, wide, true, true);
 		if( mapped )
 		{
 			return ::DrawTextW(dc, wide.c_str(), length < 0 ? -1 : (int)wide.size(), rect, format);
@@ -2079,11 +2285,75 @@ namespace User32
 		return originalDrawTextA ? originalDrawTextA(dc, text, length, rect, format) : 0;
 	}
 
+	int WINAPI DrawTextWHook(HDC dc, LPCWSTR text, int length, LPRECT rect, UINT format)
+	{
+		std::wstring wide;
+		bool mapped = text && Utility::LookupLossyDisplayNameW(text, length, wide, true, true);
+		if( mapped )
+		{
+			return originalDrawTextW ? originalDrawTextW(dc, wide.c_str(), (int)wide.size(), rect, format)
+				: ::DrawTextW(dc, wide.c_str(), (int)wide.size(), rect, format);
+		}
+		return originalDrawTextW ? originalDrawTextW(dc, text, length, rect, format) : 0;
+	}
+
+	int WINAPI DrawTextExAHook(HDC dc, LPCSTR text, int length, LPRECT rect, UINT format,
+		LPDRAWTEXTPARAMS params)
+	{
+		std::wstring wide;
+		bool mapped = text && Utility::LookupLossyDisplayName(text, length, wide, true, true);
+		if( mapped )
+			return ::DrawTextExW(dc, const_cast<LPWSTR>(wide.data()), (int)wide.size(), rect, format, params);
+		return originalDrawTextExA ? originalDrawTextExA(dc, text, length, rect, format, params) : 0;
+	}
+
+	int WINAPI DrawTextExWHook(HDC dc, LPCWSTR text, int length, LPRECT rect, UINT format,
+		LPDRAWTEXTPARAMS params)
+	{
+		std::wstring wide;
+		bool mapped = text && Utility::LookupLossyDisplayNameW(text, length, wide, true, true);
+		if( mapped )
+			return originalDrawTextExW ? originalDrawTextExW(dc, wide.data(), (int)wide.size(), rect, format, params)
+				: ::DrawTextExW(dc, const_cast<LPWSTR>(wide.data()), (int)wide.size(), rect, format, params);
+		return originalDrawTextExW ? originalDrawTextExW(dc, text, length, rect, format, params) : 0;
+	}
+
+	LONG WINAPI TabbedTextOutAHook(HDC dc, int x, int y, LPCSTR text, int length,
+		int tabs, const INT* positions, int tabOrigin)
+	{
+		std::wstring wide;
+		bool mapped = text && Utility::LookupLossyDisplayName(text, length, wide, true, true);
+		if( mapped )
+		{
+			const INT* widePositions = (positions && wide.size() == (size_t)length) ? positions : nullptr;
+			return ::TabbedTextOutW(dc, x, y, wide.data(), (int)wide.size(), tabs,
+				widePositions, tabOrigin);
+		}
+		return originalTabbedTextOutA
+			? originalTabbedTextOutA(dc, x, y, text, length, tabs, positions, tabOrigin) : 0;
+	}
+
+	LONG WINAPI TabbedTextOutWHook(HDC dc, int x, int y, LPCWSTR text, int length,
+		int tabs, const INT* positions, int tabOrigin)
+	{
+		std::wstring wide;
+		bool mapped = text && Utility::LookupLossyDisplayNameW(text, length, wide, true, true);
+		if( mapped )
+		{
+			const INT* widePositions = (positions && wide.size() == (size_t)length) ? positions : nullptr;
+			return originalTabbedTextOutW ? originalTabbedTextOutW(dc, x, y, wide.data(), (int)wide.size(), tabs,
+				widePositions, tabOrigin)
+				: ::TabbedTextOutW(dc, x, y, wide.data(), (int)wide.size(), tabs, widePositions, tabOrigin);
+		}
+		return originalTabbedTextOutW
+			? originalTabbedTextOutW(dc, x, y, text, length, tabs, positions, tabOrigin) : 0;
+	}
+
 	BOOL WINAPI ExtTextOutAHook(HDC dc, int x, int y, UINT options, const RECT* rect,
 		LPCSTR text, UINT length, const INT* spacing)
 		{
-			std::wstring wide;
-			bool mapped = text && Utility::LookupLossyDisplayName(text, (int)length, wide, true);
+		std::wstring wide;
+		bool mapped = text && Utility::LookupLossyDisplayName(text, (int)length, wide, true, true);
 		if( mapped )
 		{
 			const INT* wideSpacing = (spacing && wide.size() == length) ? spacing : nullptr;
@@ -2092,10 +2362,25 @@ namespace User32
 		return originalExtTextOutA ? originalExtTextOutA(dc, x, y, options, rect, text, length, spacing) : FALSE;
 	}
 
+	BOOL WINAPI ExtTextOutWHook(HDC dc, int x, int y, UINT options, const RECT* rect,
+		LPCWSTR text, UINT length, const INT* spacing)
+	{
+		std::wstring wide;
+		bool mapped = text && Utility::LookupLossyDisplayNameW(text, (int)length, wide, true, true);
+		if( mapped )
+		{
+			const INT* wideSpacing = (spacing && wide.size() == length) ? spacing : nullptr;
+			return originalExtTextOutW ? originalExtTextOutW(dc, x, y, options, rect,
+				wide.c_str(), (UINT)wide.size(), wideSpacing)
+				: ::ExtTextOutW(dc, x, y, options, rect, wide.c_str(), (UINT)wide.size(), wideSpacing);
+		}
+		return originalExtTextOutW ? originalExtTextOutW(dc, x, y, options, rect, text, length, spacing) : FALSE;
+	}
+
 	BOOL WINAPI TextOutAHook(HDC dc, int x, int y, LPCSTR text, int length)
 		{
-			std::wstring wide;
-			bool mapped = text && Utility::LookupLossyDisplayName(text, length, wide, true);
+		std::wstring wide;
+		bool mapped = text && Utility::LookupLossyDisplayName(text, length, wide, true, true);
 		if( mapped )
 		{
 			return ::TextOutW(dc, x, y, wide.c_str(), (int)wide.size());
@@ -2103,11 +2388,30 @@ namespace User32
 		return originalTextOutA ? originalTextOutA(dc, x, y, text, length) : FALSE;
 	}
 
+	BOOL WINAPI TextOutWHook(HDC dc, int x, int y, LPCWSTR text, int length)
+	{
+		std::wstring wide;
+		bool mapped = text && Utility::LookupLossyDisplayNameW(text, length, wide, true, true);
+		if( mapped )
+		{
+			return originalTextOutW ? originalTextOutW(dc, x, y, wide.c_str(), (int)wide.size())
+				: ::TextOutW(dc, x, y, wide.c_str(), (int)wide.size());
+		}
+		return originalTextOutW ? originalTextOutW(dc, x, y, text, length) : FALSE;
+	}
+
 	void hookTextDrawing()
 	{
 		originalDrawTextA = (decltype(originalDrawTextA))nCodeHook.createHookByName("user32.dll", "DrawTextA", DrawTextAHook);
+		originalDrawTextW = (decltype(originalDrawTextW))nCodeHook.createHookByName("user32.dll", "DrawTextW", DrawTextWHook);
+		originalDrawTextExA = (decltype(originalDrawTextExA))nCodeHook.createHookByName("user32.dll", "DrawTextExA", DrawTextExAHook);
+		originalDrawTextExW = (decltype(originalDrawTextExW))nCodeHook.createHookByName("user32.dll", "DrawTextExW", DrawTextExWHook);
+		originalTabbedTextOutA = (decltype(originalTabbedTextOutA))nCodeHook.createHookByName("user32.dll", "TabbedTextOutA", TabbedTextOutAHook);
+		originalTabbedTextOutW = (decltype(originalTabbedTextOutW))nCodeHook.createHookByName("user32.dll", "TabbedTextOutW", TabbedTextOutWHook);
 		originalExtTextOutA = (decltype(originalExtTextOutA))nCodeHook.createHookByName("gdi32.dll", "ExtTextOutA", ExtTextOutAHook);
+		originalExtTextOutW = (decltype(originalExtTextOutW))nCodeHook.createHookByName("gdi32.dll", "ExtTextOutW", ExtTextOutWHook);
 		originalTextOutA = (decltype(originalTextOutA))nCodeHook.createHookByName("gdi32.dll", "TextOutA", TextOutAHook);
+		originalTextOutW = (decltype(originalTextOutW))nCodeHook.createHookByName("gdi32.dll", "TextOutW", TextOutWHook);
 	}
 
 	bool LooksLikePath( LPCSTR text )
@@ -2121,7 +2425,7 @@ namespace User32
 	bool TryResolvePathText( HWND hWnd, LPCSTR text, std::wstring& resolved )
 	{
 		if( !text || (strchr( text, '?' ) == nullptr && !Utility::HasSyntheticAlias(text)) || !LooksLikePath( text )
-			|| !::IsWindowUnicode( hWnd ) ) return false;
+			|| !hWnd ) return false;
 
 		resolved = Utility::GetWidePath( text );
 		return !resolved.empty()
@@ -2134,8 +2438,14 @@ namespace User32
 	// WideCharToMultiByte(CP932) conversion observed by the conversion hook.
 	bool TryResolveLossyText( HWND hWnd, LPCSTR text, int length, std::wstring& resolved )
 	{
-		return text && ::IsWindowUnicode(hWnd)
-			&& Utility::LookupLossyDisplayName(text, length, resolved);
+		return text && hWnd
+			&& Utility::LookupLossyDisplayName(text, length, resolved, true, true);
+	}
+
+	bool TryResolveLossyWideText( HWND hWnd, LPCWSTR text, int length, std::wstring& resolved )
+	{
+		return text && hWnd
+			&& Utility::LookupLossyDisplayNameW(text, length, resolved, true, true);
 	}
 
 	bool LooksLikePath( LPCWSTR text )
@@ -2152,7 +2462,7 @@ namespace User32
 	bool TryResolveWidePathText( HWND hWnd, LPCWSTR text, std::wstring& resolved )
 	{
 		if( !text || !*text || !LooksLikePath(text)
-			|| !::IsWindowUnicode( hWnd ) || !wcschr(text, L'?') ) return false;
+			|| !hWnd || !wcschr(text, L'?') ) return false;
 
 		std::wstring input( text );
 		if( input.size() < 3 || input[1] != L':' || input[2] != L'\\' ) return false;
@@ -2188,8 +2498,9 @@ namespace User32
 	{
 		static thread_local bool resolving = false;
 		std::wstring resolved;
-		if( !resolving && (TryResolvePathText( hWnd, lpString, resolved )
-			|| TryResolveLossyText( hWnd, lpString, -1, resolved )) )
+		bool mapped = !resolving && (TryResolvePathText( hWnd, lpString, resolved )
+			|| TryResolveLossyText( hWnd, lpString, -1, resolved ));
+		if( mapped )
 		{
 			resolving = true;
 			BOOL ret = ::SetWindowTextW( hWnd, resolved.c_str() );
@@ -2203,7 +2514,8 @@ namespace User32
 	{
 		static thread_local bool resolving = false;
 		std::wstring resolved;
-		if( !resolving && TryResolveWidePathText( hWnd, lpString, resolved ) )
+		if( !resolving && (TryResolveWidePathText( hWnd, lpString, resolved )
+			|| TryResolveLossyWideText( hWnd, lpString, -1, resolved )) )
 		{
 			resolving = true;
 			BOOL ret = originalSetWindowTextW( hWnd, resolved.c_str() );
@@ -2232,9 +2544,10 @@ namespace User32
 	{
 		static thread_local bool resolving = false;
 		std::wstring resolved;
-		if( !resolving && IsTextMessage( message )
+		bool mapped = !resolving && IsTextMessage( message )
 			&& (TryResolvePathText( hWnd, reinterpret_cast<LPCSTR>(lParam), resolved )
-				|| TryResolveLossyText( hWnd, reinterpret_cast<LPCSTR>(lParam), -1, resolved )) )
+				|| TryResolveLossyText( hWnd, reinterpret_cast<LPCSTR>(lParam), -1, resolved ));
+		if( mapped )
 		{
 			resolving = true;
 			LRESULT ret = ::SendMessageW( hWnd, message, wParam, reinterpret_cast<LPARAM>(resolved.c_str()) );
@@ -2248,8 +2561,10 @@ namespace User32
 	{
 		static thread_local bool resolving = false;
 		std::wstring resolved;
-		if( !resolving && IsTextMessage( message )
-			&& TryResolveWidePathText( hWnd, reinterpret_cast<LPCWSTR>(lParam), resolved ) )
+		bool mapped = !resolving && IsTextMessage( message )
+			&& (TryResolveWidePathText( hWnd, reinterpret_cast<LPCWSTR>(lParam), resolved )
+				|| TryResolveLossyWideText( hWnd, reinterpret_cast<LPCWSTR>(lParam), -1, resolved ));
+		if( mapped )
 		{
 			resolving = true;
 			LRESULT ret = originalSendMessageW( hWnd, message, wParam,
@@ -2290,6 +2605,8 @@ void WriteToBufer(LPCITEMIDLIST pIDlist,const LPSTRRET pStrret, LPSTR Buf, long 
 			if( length <= Length )
 			{
 				::WideCharToMultiByte(932, 0, pStrret->pOleStr, -1, Buf, Length, 0, NULL);
+				if( Utility::HasNonAsciiWide(pStrret->pOleStr) )
+					Utility::RememberLossyDisplayName(Buf, pStrret->pOleStr);
 			}
 		}
 		break;
@@ -2495,6 +2812,43 @@ HRESULT   WINAPI SHBindToParentHook(  _In_   PCIDLIST_ABSOLUTE pidl,  _In_   REF
 void hookSHBindToParent()
 {
 	originalSHBindToParent = nCodeHook.createHookByName("shell32.dll", "SHBindToParent", SHBindToParentHook);
+}
+
+typedef DWORD_PTR (WINAPI *SHGetFileInfoAFPtr)(LPCSTR, DWORD, SHFILEINFOA*, UINT, UINT);
+SHGetFileInfoAFPtr originalSHGetFileInfoA = nullptr;
+
+DWORD_PTR WINAPI SHGetFileInfoAHook(LPCSTR path, DWORD fileAttributes,
+	SHFILEINFOA* fileInfo, UINT fileInfoSize, UINT flags)
+{
+	DWORD_PTR ret = originalSHGetFileInfoA
+		? originalSHGetFileInfoA(path, fileAttributes, fileInfo, fileInfoSize, flags) : 0;
+	if( ret && path && !(flags & SHGFI_PIDL) && fileInfo
+		&& fileInfoSize >= sizeof(SHFILEINFOA)
+		&& (flags & SHGFI_DISPLAYNAME) && fileInfo->szDisplayName[0] )
+	{
+		std::wstring realPath;
+		bool resolved = Utility::LookupSyntheticPathAlias(path, realPath)
+			|| Utility::LookupLossyDisplayName(path, -1, realPath, true);
+		if( !resolved )
+		{
+			bool ambiguous = false;
+			resolved = Utility::ResolveAnsiPathCollision(path, realPath, false, &ambiguous);
+			if( ambiguous ) resolved = false;
+		}
+		if( resolved && Utility::HasNonAsciiWide(realPath) )
+		{
+			auto slash = realPath.find_last_of(L"\\/");
+			std::wstring leaf = slash == std::wstring::npos
+				? realPath : realPath.substr(slash + 1);
+			Utility::RememberLossyDisplayName(fileInfo->szDisplayName, leaf);
+		}
+	}
+	return ret;
+}
+
+void hookSHGetFileInfo()
+{
+	originalSHGetFileInfoA = nCodeHook.createHookByName("shell32.dll", "SHGetFileInfoA", SHGetFileInfoAHook);
 }
 
 typedef UINT  (WINAPI *DragQueryFileWFPtr)(__in HDROP hDrop, __in UINT iFile, __out_ecount_opt(cch) LPWSTR lpszFile, __in UINT cch);
@@ -2776,9 +3130,9 @@ std::string GetArchiveRetryPath( LPCSTR path )
 struct ZipEntryInfo
 {
 	uint16_t method = 0;
-	uint32_t compressedSize = 0;
-	uint32_t uncompressedSize = 0;
-	uint32_t localHeaderOffset = 0;
+	uint64_t compressedSize = 0;
+	uint64_t uncompressedSize = 0;
+	uint64_t localHeaderOffset = 0;
 };
 
 bool ReadArchiveRange( HANDLE file, uint64_t offset, void* buffer, size_t size )
@@ -2808,6 +3162,51 @@ uint32_t ZipU32( const BYTE* p )
 	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+uint64_t ZipU64( const BYTE* p )
+{
+	return (uint64_t)p[0] | ((uint64_t)p[1] << 8) | ((uint64_t)p[2] << 16)
+		| ((uint64_t)p[3] << 24) | ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40)
+		| ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
+}
+
+bool ReadZip64Extra( const BYTE* extra, size_t extraLength,
+	bool needUncompressed, bool needCompressed, bool needOffset,
+	uint64_t& uncompressed, uint64_t& compressed, uint64_t& offset )
+{
+	size_t cursor = 0;
+	while( cursor + 4 <= extraLength )
+	{
+		uint16_t id = ZipU16(extra + cursor);
+		uint16_t size = ZipU16(extra + cursor + 2);
+		cursor += 4;
+		if( cursor + size > extraLength ) return false;
+		if( id == 0x0001 )
+		{
+			size_t value = cursor;
+			if( needUncompressed )
+			{
+				if( value + 8 > cursor + size ) return false;
+				uncompressed = ZipU64(extra + value);
+				value += 8;
+			}
+			if( needCompressed )
+			{
+				if( value + 8 > cursor + size ) return false;
+				compressed = ZipU64(extra + value);
+				value += 8;
+			}
+			if( needOffset )
+			{
+				if( value + 8 > cursor + size ) return false;
+				offset = ZipU64(extra + value);
+			}
+			return true;
+		}
+		cursor += size;
+	}
+	return !needUncompressed && !needCompressed && !needOffset;
+}
+
 bool BuildZipIndex( const std::wstring& path, std::vector<ZipEntryInfo>& entries )
 {
 	HANDLE file = Utility::CreateFileWLong(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -2830,22 +3229,64 @@ bool BuildZipIndex( const std::wstring& path, std::vector<ZipEntryInfo>& entries
 	}
 	if( eocd == SIZE_MAX ) { ::CloseHandle(file); return false; }
 
-	uint16_t count = ZipU16(tail.data() + eocd + 10);
-	uint32_t centralSize = ZipU32(tail.data() + eocd + 12);
-	uint32_t centralOffset = ZipU32(tail.data() + eocd + 16);
-	if( !count || !centralSize || (uint64_t)centralOffset + centralSize > (uint64_t)fileSize.QuadPart )
+	uint64_t count = ZipU16(tail.data() + eocd + 10);
+	uint64_t centralSize = ZipU32(tail.data() + eocd + 12);
+	uint64_t centralOffset = ZipU32(tail.data() + eocd + 16);
+	bool needsZip64 = count == 0xFFFFu || centralSize == 0xFFFFFFFFull
+		|| centralOffset == 0xFFFFFFFFull;
+	if( needsZip64 )
+	{
+		// The ZIP64 locator is immediately before the classic EOCD in normal
+		// archives. Search the retained tail so a variable-length archive comment
+		// cannot make the location assumption part of the parser contract.
+		size_t locator = SIZE_MAX;
+		for( size_t i = eocd; i >= 20; --i )
+		{
+			if( ZipU32(tail.data() + i - 20) == 0x07064B50u )
+			{
+				locator = i - 20;
+				break;
+			}
+		}
+		if( locator == SIZE_MAX ) { ::CloseHandle(file); return false; }
+		uint64_t zip64Offset = ZipU64(tail.data() + locator + 8);
+		if( ZipU32(tail.data() + locator + 16) != 1
+			|| zip64Offset > (uint64_t)fileSize.QuadPart
+			|| (uint64_t)fileSize.QuadPart - zip64Offset < 56 )
+		{
+			::CloseHandle(file);
+			return false;
+		}
+		BYTE zip64Header[56] = {};
+		if( !ReadArchiveRange(file, zip64Offset, zip64Header, sizeof(zip64Header))
+			|| ZipU32(zip64Header) != 0x06064B50u
+			|| ZipU64(zip64Header + 4) < 44
+			|| ZipU32(zip64Header + 16) != 0
+			|| ZipU32(zip64Header + 20) != 0 )
+		{
+			::CloseHandle(file);
+			return false;
+		}
+		count = ZipU64(zip64Header + 32);
+		centralSize = ZipU64(zip64Header + 40);
+		centralOffset = ZipU64(zip64Header + 48);
+	}
+	if( !count || centralOffset > (uint64_t)fileSize.QuadPart
+		|| centralSize > (uint64_t)fileSize.QuadPart - centralOffset
+		|| centralSize > (uint64_t)(std::numeric_limits<size_t>::max)()
+		|| count > (uint64_t)(std::numeric_limits<size_t>::max)() )
 	{
 		::CloseHandle(file);
 		return false;
 	}
 
-	std::vector<BYTE> central(centralSize);
+	std::vector<BYTE> central((size_t)centralSize);
 	ok = ReadArchiveRange(file, centralOffset, central.data(), central.size());
 	::CloseHandle(file);
 	if( !ok ) return false;
 
 	size_t cursor = 0;
-	for( uint16_t i = 0; i < count && cursor + 46 <= central.size(); ++i )
+	for( size_t i = 0; i < (size_t)count && cursor + 46 <= central.size(); ++i )
 	{
 		const BYTE* header = central.data() + cursor;
 		if( ZipU32(header) != 0x02014B50u ) return false;
@@ -2859,10 +3300,22 @@ bool BuildZipIndex( const std::wstring& path, std::vector<ZipEntryInfo>& entries
 		entry.compressedSize = ZipU32(header + 20);
 		entry.uncompressedSize = ZipU32(header + 24);
 		entry.localHeaderOffset = ZipU32(header + 42);
+		bool needsUncompressed = entry.uncompressedSize == 0xFFFFFFFFull;
+		bool needsCompressed = entry.compressedSize == 0xFFFFFFFFull;
+		bool needsOffset = entry.localHeaderOffset == 0xFFFFFFFFull;
+		if( needsUncompressed || needsCompressed || needsOffset )
+		{
+			if( !ReadZip64Extra(header + 46 + nameLength, extraLength,
+				needsUncompressed, needsCompressed, needsOffset,
+				entry.uncompressedSize, entry.compressedSize, entry.localHeaderOffset) )
+			{
+				return false;
+			}
+		}
 		entries.push_back(entry);
 		cursor += recordSize;
 	}
-	return entries.size() == count;
+	return entries.size() == (size_t)count;
 }
 
 class DeflateBitReader
@@ -3090,6 +3543,7 @@ bool ExtractZipEntry( const std::wstring& path, long index, HLOCAL* outputHandle
 	if( (size_t)index >= entries.size() ) return false;
 	const ZipEntryInfo& entry = entries[(size_t)index];
 	if( entry.uncompressedSize > (256u * 1024u * 1024u) ) return false;
+	if( entry.compressedSize > (uint64_t)(std::numeric_limits<size_t>::max)() ) return false;
 
 	HANDLE file = Utility::CreateFileWLong(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 		nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -3100,7 +3554,7 @@ bool ExtractZipEntry( const std::wstring& path, long index, HLOCAL* outputHandle
 	uint16_t nameLength = ZipU16(localHeader + 26);
 	uint16_t extraLength = ZipU16(localHeader + 28);
 	uint64_t dataOffset = (uint64_t)entry.localHeaderOffset + 30ull + nameLength + extraLength;
-	std::vector<BYTE> compressed(entry.compressedSize);
+	std::vector<BYTE> compressed((size_t)entry.compressedSize);
 	ok = ReadArchiveRange(file, dataOffset, compressed.data(), compressed.size());
 	::CloseHandle(file);
 	if( !ok ) return false;
@@ -3109,7 +3563,7 @@ bool ExtractZipEntry( const std::wstring& path, long index, HLOCAL* outputHandle
 	if( entry.method == 0 ) output = compressed;
 	else if( entry.method == 8 )
 	{
-		if( !InflateDeflate(compressed, entry.uncompressedSize, output) ) return false;
+		if( !InflateDeflate(compressed, (size_t)entry.uncompressedSize, output) ) return false;
 	}
 	else return false;
 	if( output.size() != entry.uncompressedSize ) return false;
@@ -3971,6 +4425,7 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 		User32::hookTextDrawing();
 		//�p�X�Ɖ摜�t�@�C������Unicode�Ȃ炱�ꂾ���ł����邪���Ƀt�@�C�����ʖ�
 		Shell32::hookSHBindToParent();
+		Shell32::hookSHGetFileInfo();
 		//���Ƀv���O�C�����t�b�N���邱�ƂŃv���O�C���{�̘M�炸�ɑΉ�
 		SusieAM00::hookGetProcAddress();
 		if( Profile->Get("Option","HookCreateMutex",UINT() ) )
