@@ -71,7 +71,7 @@
       <TargetMachine>MachineX86</TargetMachine>
     </Link>
     <PostBuildEvent>
-      <Command>copy "$(OutputPath)$(TargetFileName)" "$(SolutionDir)Leeyes\"</Command>
+      <Command>copy "$(OutputPath)$(TargetFileName)" "$(SolutionDir)Leeyes_debug\"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">

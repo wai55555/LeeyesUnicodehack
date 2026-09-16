@@ -21,4 +21,15 @@ Win32/
 # Anything actually deployed alongside the real (proprietary) Leeyes binary
 # is a local staging copy, not source - never commit it from here.
 /Leeyes/*
-!/Leeyes/README.md
+/Leeyes_debug/*
+
+# Local development area for the Leeyes image sorter. Keep only the public README tracked.
+leeyes-image-sorter/
+
+# Local IDE and session analysis files
+.idea/
+session-analysis/
+
+AGENTS.md
+docs/
+doc/
