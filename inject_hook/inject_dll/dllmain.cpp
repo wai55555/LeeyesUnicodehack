@@ -67,10 +67,14 @@ namespace Utility
 	};
 	std::map<std::string, LossyDisplayValue> gLossyDisplayNames;
 	std::mutex gLossyDisplayNamesMutex;
+	std::atomic<bool> gHasBestFitDisplayNames(false);
 
-	void RememberLossyDisplayName( const std::string& ansi, const std::wstring& wide )
+	void RememberLossyDisplayName( const std::string& ansi, const std::wstring& wide,
+		bool allowBestFit = false )
 	{
-		if( ansi.empty() || wide.empty() || ansi.find('?') == std::string::npos ) return;
+		if( ansi.empty() || wide.empty()
+			|| (!allowBestFit && ansi.find('?') == std::string::npos) ) return;
+		if( allowBestFit ) gHasBestFitDisplayNames.store(true, std::memory_order_release);
 		std::lock_guard<std::mutex> lock(gLossyDisplayNamesMutex);
 		auto remember = [&]( const std::string& key, const std::wstring& value )
 		{
@@ -101,6 +105,22 @@ namespace Utility
 			remember(ansi.substr(slash + 1), wide.substr(wideSlash + 1));
 	}
 
+bool HasBestFitDisplayNames()
+{
+	return gHasBestFitDisplayNames.load(std::memory_order_acquire);
+}
+
+bool IsBestFitConversion( const std::wstring& wide, const std::string& ansi )
+{
+	if( wide.empty() || ansi.empty() || ansi.find('?') != std::string::npos ) return false;
+	int length = ::MultiByteToWideChar( 932, 0, ansi.c_str(), -1, nullptr, 0 );
+	if( length <= 0 ) return false;
+	std::vector<wchar_t> roundTrip((size_t)length);
+	if( ::MultiByteToWideChar( 932, 0, ansi.c_str(), -1,
+		roundTrip.data(), length ) <= 0 ) return false;
+	return std::wstring(roundTrip.data()) != wide;
+}
+
 	bool IsDisplayNameBoundary( unsigned char ch )
 	{
 		return std::isspace(ch) != 0 || strchr("\\/:,;=[](){}<>\"'", ch) != nullptr;
@@ -118,6 +138,11 @@ namespace Utility
 			wide = found->second.wide;
 			return true;
 		}
+		// Best-fit entries are used for exact filename/path matches only. The
+		// embedded fallback is intentionally restricted to '?'-damaged text so
+		// ordinary prose containing a representable punctuation mark cannot scan
+		// or accidentally match the display map.
+		if( key.find('?') == std::string::npos ) return false;
 
 		// Only path-bearing text may use an embedded replacement.  The previous
 		// unrestricted search could replace an unrelated question mark or status
@@ -517,26 +542,48 @@ struct ReparseMountPointBuffer
 
 bool CreateDirectoryJunction( const std::wstring& linkPath, const std::wstring& targetPath )
 {
-	if( !::CreateDirectoryW( linkPath.c_str(), NULL ) )
-	{
-		if( ::GetLastError() != ERROR_ALREADY_EXISTS ) return false;
-	}
-	HANDLE hDir = CreateFileWLong( linkPath, GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
-		FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, NULL );
-	if( hDir == INVALID_HANDLE_VALUE ) return false;
-
+	if( linkPath.empty() || targetPath.empty() ) return false;
 	std::wstring substituteName = L"\\??\\" + targetPath;
 	if( !substituteName.empty() && substituteName.back() != L'\\' ) substituteName += L'\\';
 	std::wstring printName = targetPath;
 	if( !printName.empty() && printName.back() != L'\\' ) printName += L'\\';
 
+	// The mount-point reparse format stores both names in a fixed WCHAR array
+	// and uses WORD byte lengths. Validate before creating the directory so an
+	// overlong target cannot reach either memcpy below or leave an unusable alias.
+	const size_t substituteChars = substituteName.size();
+	const size_t printChars = printName.size();
+	const size_t totalChars = substituteChars + 1 + printChars + 1;
+	if( substituteChars > 0xFFFFu / sizeof(WCHAR)
+		|| printChars > 0xFFFFu / sizeof(WCHAR)
+		|| totalChars > 1024 ) return false;
+	const size_t substituteBytes = substituteChars * sizeof(WCHAR);
+	const size_t printBytes = printChars * sizeof(WCHAR);
+	const size_t reparseDataLength = 8 + substituteBytes + sizeof(WCHAR)
+		+ printBytes + sizeof(WCHAR);
+	if( reparseDataLength > 0xFFFFu ) return false;
+
 	ReparseMountPointBuffer buf = {};
+	bool createdDirectory = false;
+	if( !::CreateDirectoryW( linkPath.c_str(), NULL ) )
+	{
+		if( ::GetLastError() != ERROR_ALREADY_EXISTS ) return false;
+	}
+	else createdDirectory = true;
+	HANDLE hDir = CreateFileWLong( linkPath, GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
+		FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, NULL );
+	if( hDir == INVALID_HANDLE_VALUE )
+	{
+		if( createdDirectory ) ::RemoveDirectoryW( linkPath.c_str() );
+		return false;
+	}
+
 	buf.ReparseTag = 0xA0000003; // IO_REPARSE_TAG_MOUNT_POINT
 	buf.SubstituteNameOffset = 0;
-	buf.SubstituteNameLength = (WORD)(substituteName.size() * sizeof(WCHAR));
+	buf.SubstituteNameLength = (WORD)substituteBytes;
 	buf.PrintNameOffset = buf.SubstituteNameLength + sizeof(WCHAR);
-	buf.PrintNameLength = (WORD)(printName.size() * sizeof(WCHAR));
-	buf.ReparseDataLength = (WORD)(8 + buf.SubstituteNameLength + sizeof(WCHAR) + buf.PrintNameLength + sizeof(WCHAR));
+	buf.PrintNameLength = (WORD)printBytes;
+	buf.ReparseDataLength = (WORD)reparseDataLength;
 
 	memcpy( buf.PathBuffer, substituteName.c_str(), buf.SubstituteNameLength + sizeof(WCHAR) );
 	memcpy( (BYTE*)buf.PathBuffer + buf.PrintNameOffset, printName.c_str(), buf.PrintNameLength + sizeof(WCHAR) );
@@ -545,6 +592,7 @@ bool CreateDirectoryJunction( const std::wstring& linkPath, const std::wstring& 
 	BOOL ok = ::DeviceIoControl( hDir, 0x000900A4 /*FSCTL_SET_REPARSE_POINT*/, &buf,
 		buf.ReparseDataLength + 8, NULL, 0, &bytesReturned, NULL );
 	::CloseHandle( hDir );
+	if( !ok && createdDirectory ) ::RemoveDirectoryW( linkPath.c_str() );
 	return ok != 0;
 }
 
@@ -602,6 +650,23 @@ bool WideToCP932( const std::wstring& path, std::string& result )
 	if( length <= 0 || usedDefault ) return false;
 	result.assign( buffer, length - 1 );
 	return true;
+}
+
+bool HasAnsiPathLengthIssue( const std::string& path )
+{
+	// Leeyes and the legacy plugin ABI use MAX_PATH-sized ANSI buffers. Keep a
+	// byte for the terminating NUL and route longer paths through an alias.
+	return path.size() >= MAX_PATH - 1;
+}
+
+bool HasAnsiPathLengthIssue( LPCSTR path )
+{
+	return path && strlen(path) >= MAX_PATH - 1;
+}
+
+bool NeedsAnsiPathAlias( LPCSTR path )
+{
+	return path && (strchr(path, '?') != nullptr || HasAnsiPathLengthIssue(path));
 }
 
 // CP932 conversion is lossy: different Unicode characters can produce the same
@@ -794,7 +859,8 @@ std::string GetFullyAsciiAlias( const std::wstring& path )
 	bool isDirectory = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
 
 	std::string direct;
-	if( WideToCP932(path, direct) ) return cacheResult(direct);
+	if( WideToCP932(path, direct) && !HasAnsiPathLengthIssue(direct) )
+		return cacheResult(direct);
 
 	auto slashPos = path.find_last_of( L"\\/" );
 	if( slashPos == std::wstring::npos ) return std::string();
@@ -983,13 +1049,22 @@ void RememberSearchContext( HANDLE handle, const SearchContext& context )
 
 std::shared_ptr<SearchContextEntry> FindSearchContext( HANDLE handle )
 {
-	if( gLastSearchHandle.load() != handle ) return std::shared_ptr<SearchContextEntry>();
-	auto last = std::atomic_load(&gLastSearchEntry);
-	if( last && last->handle == handle ) return last;
+	if( gLastSearchHandle.load() == handle )
+	{
+		auto last = std::atomic_load(&gLastSearchEntry);
+		if( last && last->handle == handle ) return last;
+	}
 	for( auto& slot : gSearchContextEntries )
 	{
 		auto entry = std::atomic_load(&slot);
-		if( entry && entry->handle == handle ) return entry;
+		if( entry && entry->handle == handle )
+		{
+			// Promote an interleaved search handle so repeated calls on it use the
+			// same lock-free fast path as the most recently remembered handle.
+			std::atomic_store(&gLastSearchEntry, entry);
+			gLastSearchHandle.store(handle);
+			return entry;
+		}
 	}
 	return std::shared_ptr<SearchContextEntry>();
 }
@@ -1103,6 +1178,24 @@ bool CopyFindDataWToA( const WIN32_FIND_DATAW& source, const std::wstring& paren
 		alternateName, sizeof(alternateName), 0, 0 );
 	::WideCharToMultiByte( 932, 0, source.cFileName, -1,
 		fileName, sizeof(fileName), 0, 0 );
+
+	// A best-fit conversion can be lossy without producing '?'. Record that
+	// relationship only at the real directory-enumeration boundary, where the
+	// source UTF-16 entry is known to be a filename. This avoids inspecting all
+	// arbitrary text conversions while still allowing the drawing hook to
+	// distinguish names such as U+00B7 and U+30FB.
+	std::wstring sourceName(source.cFileName);
+	if( Utility::IsBestFitConversion(sourceName, fileName) )
+	{
+		std::string displayKey = fileName;
+		std::wstring displayValue = sourceName;
+		if( !parentDirAnsi.empty() && !parentDirWide.empty() )
+		{
+			displayKey = parentDirAnsi + "\\" + fileName;
+			displayValue = parentDirWide + L"\\" + sourceName;
+		}
+		Utility::RememberLossyDisplayName(displayKey, displayValue, true);
+	}
 
 	// '?' is not legal in a Windows filename, so one in the CP932 result means
 	// that the name was not representable. Also replace a representable leaf
@@ -1603,17 +1696,27 @@ void hookGetFileAttributesExW()
 // CreateFileA/W hooks above.
 typedef HANDLE (WINAPI *CreateFile2FPtr)(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, DWORD dwCreationDisposition, LPVOID pCreateExParams);
 CreateFile2FPtr originalCreateFile2 = nullptr;
+
+HANDLE CreateFile2ResolvedPath( const std::wstring& path, DWORD desiredAccess,
+	DWORD shareMode, DWORD creationDisposition, LPVOID extendedParams )
+{
+	if( !originalCreateFile2 ) return INVALID_HANDLE_VALUE;
+	auto extended = Utility::ToExtendedPath(path);
+	return originalCreateFile2( extended.c_str(), desiredAccess, shareMode,
+		creationDisposition, extendedParams );
+}
+
 HANDLE WINAPI CreateFile2Hook(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode, DWORD dwCreationDisposition, LPVOID pCreateExParams)
 {
 	std::wstring resolved;
 	HANDLE ret = TryResolveSyntheticWidePath(lpFileName, resolved)
-		? Utility::CreateFileWLong(resolved, dwDesiredAccess, dwShareMode, nullptr,
-			dwCreationDisposition, 0, nullptr)
+		? CreateFile2ResolvedPath(resolved, dwDesiredAccess, dwShareMode,
+			dwCreationDisposition, pCreateExParams)
 		: originalCreateFile2(lpFileName, dwDesiredAccess, dwShareMode, dwCreationDisposition, pCreateExParams);
 	if( ret == INVALID_HANDLE_VALUE && lpFileName
 		&& Utility::ResolveWidePathCollision(lpFileName, resolved) )
-		ret = Utility::CreateFileWLong(resolved, dwDesiredAccess, dwShareMode, nullptr,
-			dwCreationDisposition, 0, nullptr);
+		ret = CreateFile2ResolvedPath(resolved, dwDesiredAccess, dwShareMode,
+			dwCreationDisposition, pCreateExParams);
 #if UNICODEHACK_PATH_DEBUG
 	{
 		FILE* lf = nullptr;
@@ -2117,14 +2220,16 @@ namespace User32
 	{
 		if( !text ) return false;
 		size_t count = length < 0 ? strlen(text) : (size_t)length;
-		return memchr( text, '?', count ) != nullptr;
+		return memchr( text, '?', count ) != nullptr
+			|| Utility::HasBestFitDisplayNames();
 	}
 
 	bool NeedsLossyDisplayLookup( LPCWSTR text, int length )
 	{
 		if( !text ) return false;
 		size_t count = length < 0 ? wcslen(text) : (size_t)length;
-		return wmemchr( text, L'?', count ) != nullptr;
+		return wmemchr( text, L'?', count ) != nullptr
+			|| Utility::HasBestFitDisplayNames();
 	}
 
 	int WINAPI DrawTextAHook(HDC dc, LPCSTR text, int length, LPRECT rect, UINT format)
@@ -2949,6 +3054,7 @@ bool NeedsArchivePathAlias( LPCSTR path )
 {
 	if( !path ) return false;
 	if( strchr(path, '?') ) return true;
+	if( Utility::HasAnsiPathLengthIssue(path) ) return true;
 	for( const unsigned char* p = reinterpret_cast<const unsigned char*>(path); *p; ++p )
 		if( *p >= 0x80 ) return true;
 	return false;
@@ -2999,6 +3105,7 @@ std::string GetArchiveRetryPath( LPCSTR path )
 		std::string directPath;
 		std::wstring collisionPath;
 		if( Utility::WideToCP932BestFit(widePath, directPath)
+			&& !Utility::HasAnsiPathLengthIssue(directPath)
 			&& Utility::ResolveAnsiPathCollision(directPath, collisionPath)
 			&& collisionPath == widePath )
 			result = directPath;
@@ -3730,7 +3837,7 @@ int __stdcall IsSupportedDispatchImpl(ImagePluginCallContext* context, LPSTR Fil
 	// Per the Susie SPI convention, Dw is either a small flag/handle value or -
 	// when large enough to plausibly be one - a pointer to a header buffer the
 	// caller already read itself; only the filename+flag case needs a path retry.
-	if( !ret && Dw < 0x10000 && Filename && strchr(Filename, '?') )
+	if( !ret && Dw < 0x10000 && Utility::NeedsAnsiPathAlias(Filename) )
 	{
 		auto retryPath = Utility::GetShortPath( Filename );
 		if( !retryPath.empty() )
@@ -3743,7 +3850,7 @@ int __stdcall GetPictureInfoDispatchImpl(ImagePluginCallContext* context, LPSTR 
 {
 	auto original = reinterpret_cast<GetPictureInfoAM00FPtr>(context->original);
 	bool pathCall = !(Flag & 0x07) && Buf;
-	bool needsAlias = pathCall && strchr(Buf, '?');
+	bool needsAlias = pathCall && Utility::NeedsAnsiPathAlias(Buf);
 	// The normal case is already an ANSI-safe path. Avoid constructing any
 	// temporary strings or doing fallback bookkeeping for every JPG/PNG item.
 	if( !needsAlias )
@@ -3775,7 +3882,7 @@ int __stdcall GetPictureDispatchImpl(ImagePluginCallContext* context, LPSTR Buf,
 {
 	auto original = reinterpret_cast<GetPictureAM00FPtr>(context->original);
 	bool pathCall = !(Flag & 0x07) && Buf;
-	bool needsAlias = pathCall && strchr(Buf, '?');
+	bool needsAlias = pathCall && Utility::NeedsAnsiPathAlias(Buf);
 	// Keep the hot path equivalent to the original direct plugin call. The
 	// Unicode fallback is only needed when the ANSI path is actually damaged.
 	if( !needsAlias )
@@ -3816,13 +3923,16 @@ __declspec(naked) int __stdcall IsSupportedDispatch()
 		mov edx, [esp+4]
 		test edx, edx
 		jz image_plugin_direct
+		xor ecx, ecx
 	image_plugin_scan:
-		mov cl, [edx]
-		test cl, cl
+		cmp byte ptr [edx], 0
 		jz image_plugin_direct
-		cmp cl, '?'
+		cmp byte ptr [edx], '?'
 		je image_plugin_alias
 		inc edx
+		inc ecx
+		cmp ecx, 103h
+		jae image_plugin_alias
 		jmp image_plugin_scan
 	image_plugin_direct:
 		mov edx, [eax+4]
@@ -3846,13 +3956,16 @@ __declspec(naked) int __stdcall GetPictureInfoDispatch()
 		mov edx, [esp+4]
 		test edx, edx
 		jz image_info_direct
+		xor ecx, ecx
 	image_info_scan:
-		mov cl, [edx]
-		test cl, cl
+		cmp byte ptr [edx], 0
 		jz image_info_direct
-		cmp cl, '?'
+		cmp byte ptr [edx], '?'
 		je image_info_alias
 		inc edx
+		inc ecx
+		cmp ecx, 103h
+		jae image_info_alias
 		jmp image_info_scan
 	image_info_direct:
 		mov edx, [eax+4]
@@ -3878,13 +3991,16 @@ __declspec(naked) int __stdcall GetPictureDispatch()
 		mov edx, [esp+4]
 		test edx, edx
 		jz image_picture_direct
+		xor ecx, ecx
 	image_picture_scan:
-		mov cl, [edx]
-		test cl, cl
+		cmp byte ptr [edx], 0
 		jz image_picture_direct
-		cmp cl, '?'
+		cmp byte ptr [edx], '?'
 		je image_picture_alias
 		inc edx
+		inc ecx
+		cmp ecx, 103h
+		jae image_picture_alias
 		jmp image_picture_scan
 	image_picture_direct:
 		mov edx, [eax+4]
