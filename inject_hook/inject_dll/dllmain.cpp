@@ -22,14 +22,15 @@
 
 // File-level tracing is useful while investigating a new API path, but opening
 // and closing a log file for every image access makes normal thumbnail loading
-// disproportionately slow. Enable explicitly for diagnostics when needed.
+// disproportionately slow. The diagnostic build contains it, but the INI
+// switch keeps it disabled unless it is explicitly needed.
 #ifndef UNICODEHACK_PATH_DEBUG
 #define UNICODEHACK_PATH_DEBUG 0
 #endif
 
 // Temporary, narrow diagnostics for image-plugin path failures. This is kept
-// separate from the expensive per-file tracing above and is disabled again
-// after the WebP path is confirmed.
+// separate from the expensive per-file tracing above and is disabled in the
+// Release build; the diagnostic build uses the same INI switch.
 #ifndef UNICODEHACK_PLUGIN_DEBUG
 #define UNICODEHACK_PLUGIN_DEBUG 0
 #endif
@@ -106,7 +107,7 @@ namespace Utility
 	}
 
 	bool LookupLossyDisplayName( LPCSTR text, int length, std::wstring& wide,
-		bool allowEmbeddedPath = false )
+		bool allowEmbeddedPath = false, bool allowEmbeddedName = false )
 	{
 		if( !text ) return false;
 		std::string key(text, length < 0 ? strlen(text) : (size_t)length);
@@ -122,7 +123,8 @@ namespace Utility
 		// unrestricted search could replace an unrelated question mark or status
 		// message with a remembered filename.  Basename keys are exact-match only;
 		// embedded matching is restricted to complete path components.
-		if( !allowEmbeddedPath || key.find_first_of("\\/") == std::string::npos ) return false;
+		if( (!allowEmbeddedPath && !allowEmbeddedName)
+			|| (!allowEmbeddedPath && key.find_first_of("\\/") != std::string::npos) ) return false;
 		size_t bestPos = std::string::npos;
 		size_t bestLength = 0;
 		std::wstring bestValue;
@@ -130,7 +132,8 @@ namespace Utility
 		{
 			if( candidate.second.ambiguous ) continue;
 			if( candidate.first.size() <= bestLength ) continue;
-			if( candidate.first.find_first_of("\\/") == std::string::npos ) continue;
+			bool candidateHasPath = candidate.first.find_first_of("\\/") != std::string::npos;
+			if( candidateHasPath ? !allowEmbeddedPath : !allowEmbeddedName ) continue;
 			size_t pos = key.find(candidate.first);
 			if( pos == std::string::npos ) continue;
 			bool leftBoundary = pos == 0 || IsDisplayNameBoundary((unsigned char)key[pos - 1]);
@@ -161,6 +164,25 @@ namespace Utility
 			key.size() - bestPos - bestLength, result) ) return false;
 		wide.swap(result);
 		return true;
+	}
+
+	// A Unicode GDI call may receive the already-lossy CP932 spelling through a
+	// W wrapper. Convert that spelling back to the same key used by the ANSI
+	// enumeration map before looking up the original UTF-16 name.
+	bool LookupLossyDisplayNameW( LPCWSTR text, int length, std::wstring& wide,
+		bool allowEmbeddedPath = false, bool allowEmbeddedName = false )
+	{
+		if( !text ) return false;
+		int wideLength = length < 0 ? (int)wcslen(text) : length;
+		if( wideLength <= 0 ) return false;
+		int ansiLength = ::WideCharToMultiByte(932, 0, text, wideLength,
+			nullptr, 0, nullptr, nullptr);
+		if( ansiLength <= 0 ) return false;
+		std::string ansi((size_t)ansiLength, '\0');
+		if( ::WideCharToMultiByte(932, 0, text, wideLength, &ansi[0], ansiLength,
+			nullptr, nullptr) != ansiLength ) return false;
+		return LookupLossyDisplayName(ansi.data(), ansiLength, wide,
+			allowEmbeddedPath, allowEmbeddedName);
 	}
 
 	bool HasSyntheticAlias( const std::string& path )
@@ -217,6 +239,18 @@ namespace Utility
 		return path.c_str();
 	}
 
+	bool gDebugLogEnabled = false;
+	static thread_local bool gOpeningDebugLog = false;
+
+	bool OpenDebugLog( FILE** log )
+	{
+		if( !gDebugLogEnabled || !log || gOpeningDebugLog ) return false;
+		gOpeningDebugLog = true;
+		errno_t result = fopen_s( log, GetPathDebugLogPath(), "a" );
+		gOpeningDebugLog = false;
+		return result == 0 && *log;
+	}
+
 	// Leeyes and the old Susie APIs remain MAX_PATH/ANSI based, but the real
 	// filesystem operations can still use Windows extended-length paths. Keep
 	// the \"\\?\\\" prefix internal so it never leaks into the UI or plugins.
@@ -265,7 +299,7 @@ namespace Utility
 		return ::CreateHardLinkW( extendedLink.c_str(), extendedExisting.c_str(), NULL );
 	}
 
-std::wstring GetShortPathWLong( const std::wstring& path )
+	std::wstring GetShortPathWLong( const std::wstring& path )
 	{
 		auto extended = ToExtendedPath(path);
 		std::vector<wchar_t> buffer(MAX_PATH, L'\0');
@@ -281,6 +315,9 @@ std::wstring GetShortPathWLong( const std::wstring& path )
 		if( result.compare(0, 4, L"\\\\?\\") == 0 ) result.erase(0, 4);
 		return result;
 	}
+
+	bool ResolveAnsiPathCollision( const std::string& ansiPath, std::wstring& resolved,
+		bool preserveFinalMask = false );
 	
 std::wstring GetWidePath( std::string Path )
 {
@@ -300,6 +337,19 @@ std::wstring GetWidePath( std::string Path )
 		std::lock_guard<std::mutex> lock(gWidePathCacheMutex);
 		auto it = gWidePathCache.find( Path );
 		if( it != gWidePathCache.end() ) return it->second;
+	}
+
+	// A CP932 conversion can turn an actual Unicode name into both '?' and a
+	// best-fit spelling such as U+00B7 -> U+30FB. Resolve those lossy paths
+	// against the real directory entries before the legacy wildcard fallback
+	// can return only a parent directory or the first unrelated match.
+	std::wstring collisionPath;
+	if( Path.find('?') != std::string::npos && Path.find('*') == std::string::npos
+		&& ResolveAnsiPathCollision(Path, collisionPath) )
+	{
+		std::lock_guard<std::mutex> lock(gWidePathCacheMutex);
+		gWidePathCache[Path] = collisionPath;
+		return collisionPath;
 	}
 
 	std::wstring settled_path ;
@@ -410,6 +460,16 @@ std::wstring GetWidePath( std::string Path )
 			settled_path .append( wide_file_name );
 		}
 	}	
+	bool hasHighByte = false;
+	for( const unsigned char ch : Path )
+	{
+		if( ch >= 0x80 ) { hasHighByte = true; break; }
+	}
+	if( hasHighByte && Path.find_first_of("*?") == std::string::npos
+		&& GetFileAttributesWLong(settled_path) == INVALID_FILE_ATTRIBUTES
+		&& ResolveAnsiPathCollision(Path, collisionPath) )
+		return collisionPath;
+
 	if( Path.find('?') != std::string::npos && settled_path.find(L'?') == std::wstring::npos )
 	{
 		std::lock_guard<std::mutex> lock(gWidePathCacheMutex);
@@ -560,11 +620,12 @@ bool WideToCP932BestFit( const std::wstring& value, std::string& result )
 	return true;
 }
 
-// Recover a final path component that was collapsed by an ANSI/CP932
-// conversion.  This is deliberately not part of GetWidePath(): the normal
-// file-list path must remain a single inexpensive conversion.  Archive
-// plug-ins call this only after their original path lookup has failed.
-bool ResolveAnsiPathCollision( const std::string& ansiPath, std::wstring& resolved )
+// Recover path components that were collapsed by an ANSI/CP932 conversion.
+// The normal conversion remains the fast path; this helper is used only for
+// lossy or failed paths. When requested, a final '*' component is preserved
+// as a real search mask instead of being resolved as a filename.
+bool ResolveAnsiPathCollision( const std::string& ansiPath, std::wstring& resolved,
+	bool preserveFinalMask )
 {
 	// Resolve every component, including parents of image files and search masks.
 	// FindFirstFileW is deliberately used for existence checks: the W attribute
@@ -585,14 +646,17 @@ bool ResolveAnsiPathCollision( const std::string& ansiPath, std::wstring& resolv
 		std::wstring leaf = decoded.substr(offset, end - offset);
 		if( leaf.empty() ) { offset = end + 1; continue; }
 		if( current.back() != L'\\' ) current += L'\\';
-		if( leaf.find_first_of(L"*?") != std::wstring::npos )
+		bool hasStar = leaf.find(L'*') != std::wstring::npos;
+		bool hasQuestion = leaf.find(L'?') != std::wstring::npos;
+		if( hasStar )
 		{
-			if( end != decoded.size() ) return false;
+			if( !preserveFinalMask || end != decoded.size() ) return false;
 			resolved = current + leaf;
 			return true;
 		}
 		WIN32_FIND_DATAW data = {};
-		HANDLE h = FindFirstFileWLong(current + leaf, &data);
+		HANDLE h = INVALID_HANDLE_VALUE;
+		if( !hasQuestion ) h = FindFirstFileWLong(current + leaf, &data);
 		if( h != INVALID_HANDLE_VALUE )
 		{
 			::FindClose(h);
@@ -850,8 +914,9 @@ namespace Kernel32
 			for( int i = 0; i < wideLength; ++i )
 				if( input[i] > 0x7F ) { hasNonAscii = true; break; }
 			size_t ansiLength = (size_t)ret - (inputLength < 0 ? 1u : 0u);
+			bool inputAlreadyDamaged = wmemchr(input, L'?', (size_t)wideLength) != nullptr;
 			if( ansiLength > 0 && ansiLength <= (size_t)outputLength
-				&& hasNonAscii && memchr(output, '?', ansiLength) )
+				&& hasNonAscii && !inputAlreadyDamaged && memchr(output, '?', ansiLength) )
 			{
 				std::string ansi(output, ansiLength);
 				std::wstring wide(input, (size_t)wideLength);
@@ -965,7 +1030,7 @@ void LogFindResult( const char* api, LPCSTR pattern, LPCSTR name )
 {
 	if( !name || !strstr(name, "neekosan") ) return;
 	FILE* lf = nullptr;
-	if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") != 0 || !lf ) return;
+	if( !Utility::OpenDebugLog(&lf) ) return;
 	fprintf(lf, "%s pattern=[%s] name=[%s] bytes=", api,
 		pattern ? pattern : "<continued>", name);
 	for( const unsigned char* p = reinterpret_cast<const unsigned char*>(name); *p; ++p )
@@ -1084,6 +1149,24 @@ void FixupFindData( const std::wstring& parentDirWide, const std::string& parent
 	}
 	bool pathTooLong = HasPathLengthIssue(parentDirAnsi, lpFindFileData->cFileName);
 	if( !hasUnknown && !pathTooLong ) return;
+	std::string damagedName = lpFindFileData->cFileName;
+	if( hasUnknown && !parentDirAnsi.empty() )
+	{
+		// The ANSI result may contain both a '?' replacement and a CP932
+		// best-fit character (U+00B7 becomes U+30FB). Resolve the complete path
+		// by comparing the best-fit byte spelling against the real W directory
+		// entries. When the result is unique, retain the original UTF-16 name
+		// solely for display; cFileName remains the old ANSI/alternate value.
+		std::wstring exactWide;
+		if( Utility::ResolveAnsiPathCollision(parentDirAnsi + "\\" + damagedName, exactWide) )
+		{
+			auto wideSlash = exactWide.find_last_of(L"\\/");
+			std::wstring exactLeaf = wideSlash == std::wstring::npos
+				? exactWide : exactWide.substr(wideSlash + 1);
+			Utility::RememberLossyDisplayName(damagedName, exactLeaf);
+			Utility::RememberLossyDisplayName(parentDirAnsi + "\\" + damagedName, exactWide);
+		}
+	}
 
 	if( lpFindFileData->cAlternateFileName[0] )
 	{
@@ -1127,7 +1210,8 @@ HANDLE  WINAPI FindFirstFileHook(LPCTSTR lpFileName,  LPWIN32_FIND_DATA lpFindFi
 		&& !Utility::HasSyntheticAlias(lpFileName) )
 	{
 		std::wstring realPath;
-		if( Utility::ResolveAnsiPathCollision(lpFileName, realPath) )
+		if( Utility::ResolveAnsiPathCollision(lpFileName, realPath,
+			strchr(lpFileName, '*') != nullptr) )
 		{
 			WIN32_FIND_DATAW data = {};
 			ret = Utility::FindFirstFileWLong(realPath, &data);
@@ -1216,7 +1300,7 @@ void hookFindFirstFile()
 		originalFindFirstFile = nCodeHook.createHookByName("kernel32.dll", "FindFirstFileA", FindFirstFileHook);
 	}
 	FILE* lf = nullptr;
-	if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+	if( Utility::OpenDebugLog(&lf) )
 	{
 		fprintf(lf, "hookFindFirstFile install %s\n", originalFindFirstFile ? "OK" : "FAILED");
 		fclose(lf);
@@ -1265,7 +1349,7 @@ void hookFindNextFile()
 		originalFindNextFile = nCodeHook.createHookByName("kernel32.dll", "FindNextFileA", FindNextFileHook);
 	}
 	FILE* lf = nullptr;
-	if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+	if( Utility::OpenDebugLog(&lf) )
 	{
 		fprintf(lf, "hookFindNextFile install %s\n", originalFindNextFile ? "OK" : "FAILED");
 		fclose(lf);
@@ -1347,7 +1431,7 @@ HANDLE  WINAPI CreateFileAHook(    __in     LPCSTR lpFileName,
 #if UNICODEHACK_PATH_DEBUG
 	{
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+		if( Utility::OpenDebugLog(&lf) )
 		{
 			fprintf(lf, "CreateFileA in=[%s] ret=%s\n", lpFileName ? lpFileName : "<null>", (ret != INVALID_HANDLE_VALUE) ? "SUCCESS" : "FAIL");
 			fclose(lf);
@@ -1366,7 +1450,7 @@ HANDLE  WINAPI CreateFileAHook(    __in     LPCSTR lpFileName,
 	#if UNICODEHACK_PATH_DEBUG
 		{
 			FILE* lf = nullptr;
-			if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+			if( Utility::OpenDebugLog(&lf) )
 			{
 				fprintf(lf, "ansi_in=[%s]\n", lpFileName);
 				char wideAsAnsiForLog[MAX_PATH*2] = {};
@@ -1381,7 +1465,7 @@ HANDLE  WINAPI CreateFileAHook(    __in     LPCSTR lpFileName,
 	#if UNICODEHACK_PATH_DEBUG
 		{
 			FILE* lf = nullptr;
-			if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+			if( Utility::OpenDebugLog(&lf) )
 			{
 				fprintf(lf, "CreateFileW result: %s (lastError=%lu)\n", (ret != INVALID_HANDLE_VALUE) ? "SUCCESS" : "FAIL", lastErr2);
 				fclose(lf);
@@ -1396,7 +1480,7 @@ void hookCreateFileA()
 {
 	originalCreateFileA = nCodeHook.createHookByName("kernelbase.dll", "CreateFileA", CreateFileAHook);
 	FILE* lf = nullptr;
-	if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+	if( Utility::OpenDebugLog(&lf) )
 	{
 		fprintf(lf, "hookCreateFileA install %s\n", originalCreateFileA ? "OK" : "FAILED");
 		fclose(lf);
@@ -1454,7 +1538,7 @@ HANDLE  WINAPI CreateFileWHook(    __in     LPCWSTR lpFileName,
 #if UNICODEHACK_PATH_DEBUG
 	{
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+		if( Utility::OpenDebugLog(&lf) )
 		{
 			char utf8[MAX_PATH*2] = {};
 			WideCharToMultiByte(CP_UTF8, 0, lpFileName ? lpFileName : L"<null>", -1, utf8, sizeof(utf8), 0, 0);
@@ -1469,7 +1553,7 @@ void hookCreateFileW()
 {
 	originalCreateFileW = nCodeHook.createHookByName("kernelbase.dll", "CreateFileW", CreateFileWHook);
 	FILE* lf = nullptr;
-	if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+	if( Utility::OpenDebugLog(&lf) )
 	{
 		fprintf(lf, "hookCreateFileW install %s\n", originalCreateFileW ? "OK" : "FAILED");
 		fclose(lf);
@@ -1533,7 +1617,7 @@ HANDLE WINAPI CreateFile2Hook(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD d
 #if UNICODEHACK_PATH_DEBUG
 	{
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+		if( Utility::OpenDebugLog(&lf) )
 		{
 			char utf8[MAX_PATH*2] = {};
 			WideCharToMultiByte(CP_UTF8, 0, lpFileName ? lpFileName : L"<null>", -1, utf8, sizeof(utf8), 0, 0);
@@ -1548,7 +1632,7 @@ void hookCreateFile2()
 {
 	originalCreateFile2 = nCodeHook.createHookByName("kernelbase.dll", "CreateFile2", CreateFile2Hook);
 	FILE* lf = nullptr;
-	if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+	if( Utility::OpenDebugLog(&lf) )
 	{
 		fprintf(lf, "hookCreateFile2 install %s\n", originalCreateFile2 ? "OK" : "FAILED");
 		fclose(lf);
@@ -1584,7 +1668,7 @@ DWORD WINAPI GetFileAttributesAHook( LPCSTR lpFileName )
 #if UNICODEHACK_PATH_DEBUG
 	{
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+		if( Utility::OpenDebugLog(&lf) )
 		{
 			fprintf(lf, "GetFileAttributesA in=[%s] ret=%s\n", lpFileName ? lpFileName : "<null>", (ret != INVALID_FILE_ATTRIBUTES) ? "SUCCESS" : "FAIL");
 			fclose(lf);
@@ -1603,7 +1687,7 @@ DWORD WINAPI GetFileAttributesAHook( LPCSTR lpFileName )
 		ret = Utility::GetFileAttributesWLong( resolvedWide );
 #if UNICODEHACK_PATH_DEBUG
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+		if( Utility::OpenDebugLog(&lf) )
 		{
 			char wideAsAnsiForLog[MAX_PATH*2] = {};
 			WideCharToMultiByte(CP_UTF8, 0, resolvedWide.c_str(), -1, wideAsAnsiForLog, sizeof(wideAsAnsiForLog), 0, 0);
@@ -1619,7 +1703,7 @@ void hookGetFileAttributesA()
 {
 	originalGetFileAttributesA = nCodeHook.createHookByName("kernelbase.dll", "GetFileAttributesA", GetFileAttributesAHook);
 	FILE* lf = nullptr;
-	if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+	if( Utility::OpenDebugLog(&lf) )
 	{
 		fprintf(lf, "hookGetFileAttributesA install %s\n", originalGetFileAttributesA ? "OK" : "FAILED");
 		fclose(lf);
@@ -1650,7 +1734,7 @@ BOOL WINAPI GetFileAttributesExAHook( LPCSTR lpFileName, GET_FILEEX_INFO_LEVELS 
 #if UNICODEHACK_PATH_DEBUG
 	{
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+		if( Utility::OpenDebugLog(&lf) )
 		{
 			fprintf(lf, "GetFileAttributesExA in=[%s] ret=%s\n", lpFileName ? lpFileName : "<null>", ret ? "SUCCESS" : "FAIL");
 			fclose(lf);
@@ -1674,7 +1758,7 @@ void hookGetFileAttributesExA()
 {
 	originalGetFileAttributesExA = nCodeHook.createHookByName("kernelbase.dll", "GetFileAttributesExA", GetFileAttributesExAHook);
 	FILE* lf = nullptr;
-	if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+	if( Utility::OpenDebugLog(&lf) )
 	{
 		fprintf(lf, "hookGetFileAttributesExA install %s\n", originalGetFileAttributesExA ? "OK" : "FAILED");
 		fclose(lf);
@@ -1952,7 +2036,7 @@ void hookCreateMutexA()
 {
 	originalCreateMutexA = nCodeHook.createHookByName("kernelbase.dll", "CreateMutexA", CreateMutexAHook);
 	FILE* lf = nullptr;
-	if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+	if( Utility::OpenDebugLog(&lf) )
 	{
 		fprintf(lf, "hookCreateMutexA install %s\n", originalCreateMutexA ? "OK" : "FAILED");
 		fclose(lf);
@@ -1974,13 +2058,84 @@ namespace User32
 	bool IsTextMessage( UINT message );
 
 	int (WINAPI *originalDrawTextA)(HDC, LPCSTR, int, LPRECT, UINT) = nullptr;
+	int (WINAPI *originalDrawTextW)(HDC, LPCWSTR, int, LPRECT, UINT) = nullptr;
+	int (WINAPI *originalDrawTextExA)(HDC, LPCSTR, int, LPRECT, UINT, LPDRAWTEXTPARAMS) = nullptr;
+	int (WINAPI *originalDrawTextExW)(HDC, LPCWSTR, int, LPRECT, UINT, LPDRAWTEXTPARAMS) = nullptr;
+	LONG (WINAPI *originalTabbedTextOutA)(HDC, int, int, LPCSTR, int, int, const INT*, int) = nullptr;
+	LONG (WINAPI *originalTabbedTextOutW)(HDC, int, int, LPCWSTR, int, int, const INT*, int) = nullptr;
 	BOOL (WINAPI *originalExtTextOutA)(HDC, int, int, UINT, const RECT*, LPCSTR, UINT, const INT*) = nullptr;
+	BOOL (WINAPI *originalExtTextOutW)(HDC, int, int, UINT, const RECT*, LPCWSTR, UINT, const INT*) = nullptr;
 	BOOL (WINAPI *originalTextOutA)(HDC, int, int, LPCSTR, int) = nullptr;
+	BOOL (WINAPI *originalTextOutW)(HDC, int, int, LPCWSTR, int) = nullptr;
+
+#if UNICODEHACK_PATH_DEBUG
+	void LogDisplayProbeA( const char* api, LPCSTR text, int length, bool mapped,
+		const std::wstring& resolved )
+	{
+		if( !text ) return;
+		std::string value(text, length < 0 ? strlen(text) : (size_t)length);
+		if( value.find("Prim") == std::string::npos ) return;
+		FILE* lf = nullptr;
+		if( !Utility::OpenDebugLog(&lf) ) return;
+		fprintf(lf, "display %s mapped=%s len=%d input=[", api, mapped ? "yes" : "no", length);
+		for( unsigned char ch : value ) fprintf(lf, "%02X", ch );
+		fprintf(lf, "] resolved=");
+		char utf8[MAX_PATH * 2] = {};
+		if( !resolved.empty() )
+			::WideCharToMultiByte(CP_UTF8, 0, resolved.c_str(), -1,
+				utf8, sizeof(utf8), nullptr, nullptr);
+		fprintf(lf, "[%s]\n", utf8);
+		fclose(lf);
+	}
+
+	void LogDisplayProbeW( const char* api, LPCWSTR text, int length, bool mapped,
+		const std::wstring& resolved )
+	{
+		if( !text ) return;
+		int count = length < 0 ? (int)wcslen(text) : length;
+		std::wstring value(text, count < 0 ? 0 : count);
+		if( value.find(L"Prim") == std::wstring::npos ) return;
+		FILE* lf = nullptr;
+		if( !Utility::OpenDebugLog(&lf) ) return;
+		char inputUtf8[MAX_PATH * 2] = {};
+		char resolvedUtf8[MAX_PATH * 2] = {};
+		::WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1,
+			inputUtf8, sizeof(inputUtf8), nullptr, nullptr);
+		if( !resolved.empty() )
+			::WideCharToMultiByte(CP_UTF8, 0, resolved.c_str(), -1,
+				resolvedUtf8, sizeof(resolvedUtf8), nullptr, nullptr);
+		fprintf(lf, "display %s mapped=%s len=%d input=[%s] resolved=[%s]\n",
+			api, mapped ? "yes" : "no", length, inputUtf8, resolvedUtf8);
+		fclose(lf);
+	}
+#endif
+
+	// Lossy display names are recorded only when the ANSI spelling contains a
+	// '?' replacement. Avoid taking the display-name mutex for ordinary text,
+	// which passes through the drawing hooks much more often than a repaired name.
+	bool NeedsLossyDisplayLookup( LPCSTR text, int length )
+	{
+		if( !text ) return false;
+		size_t count = length < 0 ? strlen(text) : (size_t)length;
+		return memchr( text, '?', count ) != nullptr;
+	}
+
+	bool NeedsLossyDisplayLookup( LPCWSTR text, int length )
+	{
+		if( !text ) return false;
+		size_t count = length < 0 ? wcslen(text) : (size_t)length;
+		return wmemchr( text, L'?', count ) != nullptr;
+	}
 
 	int WINAPI DrawTextAHook(HDC dc, LPCSTR text, int length, LPRECT rect, UINT format)
 	{
+		if( !NeedsLossyDisplayLookup(text, length) )
+			return originalDrawTextA ? originalDrawTextA(dc, text, length, rect, format) : 0;
 		std::wstring wide;
-		bool mapped = text && Utility::LookupLossyDisplayName(text, length, wide, true);
+		bool mapped = Utility::LookupLossyDisplayName(text, length, wide, true, true);
+	#if UNICODEHACK_PATH_DEBUG
+		LogDisplayProbeA("DrawTextA", text, length, mapped, wide);
+	#endif
 		if( mapped )
 		{
 			return ::DrawTextW(dc, wide.c_str(), length < 0 ? -1 : (int)wide.size(), rect, format);
@@ -1988,11 +2143,119 @@ namespace User32
 		return originalDrawTextA ? originalDrawTextA(dc, text, length, rect, format) : 0;
 	}
 
+	int WINAPI DrawTextWHook(HDC dc, LPCWSTR text, int length, LPRECT rect, UINT format)
+	{
+		if( !NeedsLossyDisplayLookup(text, length) )
+			return originalDrawTextW ? originalDrawTextW(dc, text, length, rect, format) : 0;
+		std::wstring wide;
+		bool mapped = Utility::LookupLossyDisplayNameW(text, length, wide, true, true);
+	#if UNICODEHACK_PATH_DEBUG
+		LogDisplayProbeW("DrawTextW", text, length, mapped, wide);
+	#endif
+		if( mapped )
+		{
+			return originalDrawTextW ? originalDrawTextW(dc, wide.c_str(), (int)wide.size(), rect, format)
+				: ::DrawTextW(dc, wide.c_str(), (int)wide.size(), rect, format);
+		}
+		return originalDrawTextW ? originalDrawTextW(dc, text, length, rect, format) : 0;
+	}
+
+	int WINAPI DrawTextExAHook(HDC dc, LPCSTR text, int length, LPRECT rect, UINT format,
+		LPDRAWTEXTPARAMS params)
+	{
+		if( !NeedsLossyDisplayLookup(text, length) )
+			return originalDrawTextExA ? originalDrawTextExA(dc, text, length, rect, format, params) : 0;
+		std::wstring wide;
+		bool mapped = Utility::LookupLossyDisplayName(text, length, wide, true, true);
+	#if UNICODEHACK_PATH_DEBUG
+		LogDisplayProbeA("DrawTextExA", text, length, mapped, wide);
+	#endif
+		if( mapped )
+		{
+			// DT_MODIFYSTRING writes an ellipsis into the caller's ANSI buffer.
+			// Keep that uncommon mutation mode on the original path because the
+			// temporary UTF-16 buffer has no caller-provided spare capacity.
+			if( format & DT_MODIFYSTRING )
+				return originalDrawTextExA ? originalDrawTextExA(dc, text, length, rect, format, params) : 0;
+			return ::DrawTextExW(dc, const_cast<LPWSTR>(wide.data()), (int)wide.size(), rect, format, params);
+		}
+		return originalDrawTextExA ? originalDrawTextExA(dc, text, length, rect, format, params) : 0;
+	}
+
+	int WINAPI DrawTextExWHook(HDC dc, LPCWSTR text, int length, LPRECT rect, UINT format,
+		LPDRAWTEXTPARAMS params)
+	{
+		if( !NeedsLossyDisplayLookup(text, length) )
+			return originalDrawTextExW ? originalDrawTextExW(dc, text, length, rect, format, params) : 0;
+		std::wstring wide;
+		bool mapped = Utility::LookupLossyDisplayNameW(text, length, wide, true, true);
+	#if UNICODEHACK_PATH_DEBUG
+		LogDisplayProbeW("DrawTextExW", text, length, mapped, wide);
+	#endif
+		if( mapped )
+		{
+			if( format & DT_MODIFYSTRING )
+				return originalDrawTextExW ? originalDrawTextExW(dc, text, length, rect, format, params) : 0;
+			return originalDrawTextExW ? originalDrawTextExW(dc, wide.data(), (int)wide.size(), rect, format, params)
+				: ::DrawTextExW(dc, const_cast<LPWSTR>(wide.data()), (int)wide.size(), rect, format, params);
+		}
+		return originalDrawTextExW ? originalDrawTextExW(dc, text, length, rect, format, params) : 0;
+	}
+
+	LONG WINAPI TabbedTextOutAHook(HDC dc, int x, int y, LPCSTR text, int length,
+		int tabs, const INT* positions, int tabOrigin)
+	{
+		if( !NeedsLossyDisplayLookup(text, length) )
+			return originalTabbedTextOutA
+				? originalTabbedTextOutA(dc, x, y, text, length, tabs, positions, tabOrigin) : 0;
+		std::wstring wide;
+		bool mapped = Utility::LookupLossyDisplayName(text, length, wide, true, true);
+	#if UNICODEHACK_PATH_DEBUG
+		LogDisplayProbeA("TabbedTextOutA", text, length, mapped, wide);
+	#endif
+		if( mapped )
+		{
+			const INT* widePositions = (positions && wide.size() == (size_t)length) ? positions : nullptr;
+			return ::TabbedTextOutW(dc, x, y, wide.data(), (int)wide.size(), tabs,
+				widePositions, tabOrigin);
+		}
+		return originalTabbedTextOutA
+			? originalTabbedTextOutA(dc, x, y, text, length, tabs, positions, tabOrigin) : 0;
+	}
+
+	LONG WINAPI TabbedTextOutWHook(HDC dc, int x, int y, LPCWSTR text, int length,
+		int tabs, const INT* positions, int tabOrigin)
+	{
+		if( !NeedsLossyDisplayLookup(text, length) )
+			return originalTabbedTextOutW
+				? originalTabbedTextOutW(dc, x, y, text, length, tabs, positions, tabOrigin) : 0;
+		std::wstring wide;
+		bool mapped = Utility::LookupLossyDisplayNameW(text, length, wide, true, true);
+	#if UNICODEHACK_PATH_DEBUG
+		LogDisplayProbeW("TabbedTextOutW", text, length, mapped, wide);
+	#endif
+		if( mapped )
+		{
+			const INT* widePositions = (positions && wide.size() == (size_t)length) ? positions : nullptr;
+			return originalTabbedTextOutW ? originalTabbedTextOutW(dc, x, y, wide.data(), (int)wide.size(), tabs,
+				widePositions, tabOrigin)
+				: ::TabbedTextOutW(dc, x, y, wide.data(), (int)wide.size(), tabs, widePositions, tabOrigin);
+		}
+		return originalTabbedTextOutW
+			? originalTabbedTextOutW(dc, x, y, text, length, tabs, positions, tabOrigin) : 0;
+	}
+
 	BOOL WINAPI ExtTextOutAHook(HDC dc, int x, int y, UINT options, const RECT* rect,
 		LPCSTR text, UINT length, const INT* spacing)
 		{
-			std::wstring wide;
-			bool mapped = text && Utility::LookupLossyDisplayName(text, (int)length, wide, true);
+		if( !NeedsLossyDisplayLookup(text, (int)length) )
+			return originalExtTextOutA
+				? originalExtTextOutA(dc, x, y, options, rect, text, length, spacing) : FALSE;
+		std::wstring wide;
+		bool mapped = Utility::LookupLossyDisplayName(text, (int)length, wide, true, true);
+	#if UNICODEHACK_PATH_DEBUG
+		LogDisplayProbeA("ExtTextOutA", text, (int)length, mapped, wide);
+	#endif
 		if( mapped )
 		{
 			const INT* wideSpacing = (spacing && wide.size() == length) ? spacing : nullptr;
@@ -2001,10 +2264,36 @@ namespace User32
 		return originalExtTextOutA ? originalExtTextOutA(dc, x, y, options, rect, text, length, spacing) : FALSE;
 	}
 
+	BOOL WINAPI ExtTextOutWHook(HDC dc, int x, int y, UINT options, const RECT* rect,
+		LPCWSTR text, UINT length, const INT* spacing)
+	{
+		if( !NeedsLossyDisplayLookup(text, (int)length) )
+			return originalExtTextOutW
+				? originalExtTextOutW(dc, x, y, options, rect, text, length, spacing) : FALSE;
+		std::wstring wide;
+		bool mapped = Utility::LookupLossyDisplayNameW(text, (int)length, wide, true, true);
+	#if UNICODEHACK_PATH_DEBUG
+		LogDisplayProbeW("ExtTextOutW", text, (int)length, mapped, wide);
+	#endif
+		if( mapped )
+		{
+			const INT* wideSpacing = (spacing && wide.size() == length) ? spacing : nullptr;
+			return originalExtTextOutW ? originalExtTextOutW(dc, x, y, options, rect,
+				wide.c_str(), (UINT)wide.size(), wideSpacing)
+				: ::ExtTextOutW(dc, x, y, options, rect, wide.c_str(), (UINT)wide.size(), wideSpacing);
+		}
+		return originalExtTextOutW ? originalExtTextOutW(dc, x, y, options, rect, text, length, spacing) : FALSE;
+	}
+
 	BOOL WINAPI TextOutAHook(HDC dc, int x, int y, LPCSTR text, int length)
 		{
-			std::wstring wide;
-			bool mapped = text && Utility::LookupLossyDisplayName(text, length, wide, true);
+		if( !NeedsLossyDisplayLookup(text, length) )
+			return originalTextOutA ? originalTextOutA(dc, x, y, text, length) : FALSE;
+		std::wstring wide;
+		bool mapped = Utility::LookupLossyDisplayName(text, length, wide, true, true);
+	#if UNICODEHACK_PATH_DEBUG
+		LogDisplayProbeA("TextOutA", text, length, mapped, wide);
+	#endif
 		if( mapped )
 		{
 			return ::TextOutW(dc, x, y, wide.c_str(), (int)wide.size());
@@ -2012,11 +2301,35 @@ namespace User32
 		return originalTextOutA ? originalTextOutA(dc, x, y, text, length) : FALSE;
 	}
 
+	BOOL WINAPI TextOutWHook(HDC dc, int x, int y, LPCWSTR text, int length)
+	{
+		if( !NeedsLossyDisplayLookup(text, length) )
+			return originalTextOutW ? originalTextOutW(dc, x, y, text, length) : FALSE;
+		std::wstring wide;
+		bool mapped = Utility::LookupLossyDisplayNameW(text, length, wide, true, true);
+	#if UNICODEHACK_PATH_DEBUG
+		LogDisplayProbeW("TextOutW", text, length, mapped, wide);
+	#endif
+		if( mapped )
+		{
+			return originalTextOutW ? originalTextOutW(dc, x, y, wide.c_str(), (int)wide.size())
+				: ::TextOutW(dc, x, y, wide.c_str(), (int)wide.size());
+		}
+		return originalTextOutW ? originalTextOutW(dc, x, y, text, length) : FALSE;
+	}
+
 	void hookTextDrawing()
 	{
 		originalDrawTextA = (decltype(originalDrawTextA))nCodeHook.createHookByName("user32.dll", "DrawTextA", DrawTextAHook);
+		originalDrawTextW = (decltype(originalDrawTextW))nCodeHook.createHookByName("user32.dll", "DrawTextW", DrawTextWHook);
+		originalDrawTextExA = (decltype(originalDrawTextExA))nCodeHook.createHookByName("user32.dll", "DrawTextExA", DrawTextExAHook);
+		originalDrawTextExW = (decltype(originalDrawTextExW))nCodeHook.createHookByName("user32.dll", "DrawTextExW", DrawTextExWHook);
+		originalTabbedTextOutA = (decltype(originalTabbedTextOutA))nCodeHook.createHookByName("user32.dll", "TabbedTextOutA", TabbedTextOutAHook);
+		originalTabbedTextOutW = (decltype(originalTabbedTextOutW))nCodeHook.createHookByName("user32.dll", "TabbedTextOutW", TabbedTextOutWHook);
 		originalExtTextOutA = (decltype(originalExtTextOutA))nCodeHook.createHookByName("gdi32.dll", "ExtTextOutA", ExtTextOutAHook);
+		originalExtTextOutW = (decltype(originalExtTextOutW))nCodeHook.createHookByName("gdi32.dll", "ExtTextOutW", ExtTextOutWHook);
 		originalTextOutA = (decltype(originalTextOutA))nCodeHook.createHookByName("gdi32.dll", "TextOutA", TextOutAHook);
+		originalTextOutW = (decltype(originalTextOutW))nCodeHook.createHookByName("gdi32.dll", "TextOutW", TextOutWHook);
 	}
 
 	bool LooksLikePath( LPCSTR text )
@@ -2176,7 +2489,7 @@ namespace User32
 		originalSendMessageA = nCodeHook.createHookByName("user32.dll", "SendMessageA", SendMessageAHook);
 		originalSendMessageW = nCodeHook.createHookByName("user32.dll", "SendMessageW", SendMessageWHook);
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+		if( Utility::OpenDebugLog(&lf) )
 		{
 			fprintf(lf, "hookWindowText install A=%s W=%s SendA=%s SendW=%s\n",
 				originalSetWindowTextA ? "OK" : "FAILED", originalSetWindowTextW ? "OK" : "FAILED",
@@ -2418,7 +2731,7 @@ UINT WINAPI DragQueryFileWHook( __in HDROP hDrop, __in UINT iFile, __out_ecount_
 	#if UNICODEHACK_PATH_DEBUG
 	{
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+		if( Utility::OpenDebugLog(&lf) )
 		{
 			char pathUtf8[MAX_PATH * 2] = {};
 			if( lpszFile ) WideCharToMultiByte(CP_UTF8, 0, lpszFile, -1, pathUtf8, sizeof(pathUtf8), 0, 0);
@@ -2453,7 +2766,7 @@ UINT WINAPI DragQueryFileWHook( __in HDROP hDrop, __in UINT iFile, __out_ecount_
 	if( originalPath.find(L"neekosan") != std::wstring::npos )
 	{
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+		if( Utility::OpenDebugLog(&lf) )
 		{
 			char originalUtf8[MAX_PATH * 2] = {};
 			char legacyUtf8[MAX_PATH * 2] = {};
@@ -2478,7 +2791,7 @@ void hookDragQueryFileW()
 	originalDragQueryFileW = nCodeHook.createHookByName("shell32.dll", "DragQueryFileW", DragQueryFileWHook);
 	#if UNICODEHACK_PATH_DEBUG
 	FILE* lf = nullptr;
-	if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+	if( Utility::OpenDebugLog(&lf) )
 	{
 		fprintf(lf, "hookDragQueryFileW install %s\n", originalDragQueryFileW ? "OK" : "FAILED");
 		fclose(lf);
@@ -2495,7 +2808,7 @@ UINT   WINAPI DragQueryFileAHook( __in HDROP hDrop, __in UINT iFile, __out_ecoun
 	#if UNICODEHACK_PATH_DEBUG
 	{
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+		if( Utility::OpenDebugLog(&lf) )
 		{
 			fprintf(lf, "DragQueryFileA call i=%u cch=%u size=%u hasBuffer=%s\n",
 				iFile, cch, size, lpszFile ? "yes" : "no");
@@ -2536,7 +2849,7 @@ UINT   WINAPI DragQueryFileAHook( __in HDROP hDrop, __in UINT iFile, __out_ecoun
 			{
 				#if UNICODEHACK_PATH_DEBUG
 				FILE* lf = nullptr;
-				if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+				if( Utility::OpenDebugLog(&lf) )
 				{
 					char wideUtf8[MAX_PATH * 2] = {};
 					WideCharToMultiByte(CP_UTF8, 0, directCollisionPath.c_str(), -1, wideUtf8, sizeof(wideUtf8), 0, 0);
@@ -2563,7 +2876,7 @@ UINT   WINAPI DragQueryFileAHook( __in HDROP hDrop, __in UINT iFile, __out_ecoun
 				::strcpy_s(lpszFile, cch, safePath.c_str());
 				#if UNICODEHACK_PATH_DEBUG
 				FILE* lf = nullptr;
-				if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+				if( Utility::OpenDebugLog(&lf) )
 				{
 					char wideUtf8[MAX_PATH * 2] = {};
 					WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, wideUtf8, sizeof(wideUtf8), 0, 0);
@@ -2594,7 +2907,7 @@ void hookDragQueryFileA()
 	originalDragQueryFileA = nCodeHook.createHookByName("shell32.dll", "DragQueryFileA", DragQueryFileAHook);
 	#if UNICODEHACK_PATH_DEBUG
 	FILE* lf = nullptr;
-	if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+	if( Utility::OpenDebugLog(&lf) )
 	{
 		fprintf(lf, "hookDragQueryFileA install %s\n", originalDragQueryFileA ? "OK" : "FAILED");
 		fclose(lf);
@@ -2629,6 +2942,8 @@ GetArchiveInfoAM00FPtr originalGetArchiveInfo = nullptr;
 GetFileAM00FPtr originalGetFile = nullptr;
 std::map<std::string, std::wstring> gArchiveWidePathCache;
 std::mutex gArchiveWidePathCacheMutex;
+std::map<std::string, std::string> gArchiveRetryPathCache;
+std::mutex gArchiveRetryPathCacheMutex;
 
 bool NeedsArchivePathAlias( LPCSTR path )
 {
@@ -2666,20 +2981,38 @@ std::wstring GetArchiveWidePath( LPCSTR path )
 
 std::string GetArchiveRetryPath( LPCSTR path )
 {
+	if( !path ) return std::string();
+	std::string ansiPath(path);
+	{
+		std::lock_guard<std::mutex> lock(gArchiveRetryPathCacheMutex);
+		auto it = gArchiveRetryPathCache.find(ansiPath);
+		if( it != gArchiveRetryPathCache.end() ) return it->second;
+	}
+
 	std::wstring widePath = GetArchiveWidePath(path);
-	if( widePath.empty() ) return std::string();
+	std::string result;
+	if( !widePath.empty() )
+	{
+		// If CP932 gives us a unique real directory entry, keep the plugin on the
+		// user's actual path. The A/W file hooks repair the lossy CP932 spelling at
+		// the filesystem boundary, so no TEMP alias is needed when it is unique.
+		std::string directPath;
+		std::wstring collisionPath;
+		if( Utility::WideToCP932BestFit(widePath, directPath)
+			&& Utility::ResolveAnsiPathCollision(directPath, collisionPath)
+			&& collisionPath == widePath )
+			result = directPath;
+		else
+			result = Utility::GetArchivePathAlias( widePath );
+	}
 
-	// If CP932 gives us a unique real directory entry, keep the plugin on the
-	// user's actual path. The A/W file hooks repair the lossy CP932 spelling at
-	// the filesystem boundary, so no TEMP alias is needed when it is unique.
-	std::string directPath;
-	std::wstring collisionPath;
-	if( Utility::WideToCP932BestFit(widePath, directPath)
-		&& Utility::ResolveAnsiPathCollision(directPath, collisionPath)
-		&& collisionPath == widePath )
-		return directPath;
-
-	return Utility::GetArchivePathAlias( widePath );
+	// Cache failures as well as successful paths. Otherwise a plugin that asks
+	// for the same unavailable path repeatedly would repeat the collision scan.
+	{
+		std::lock_guard<std::mutex> lock(gArchiveRetryPathCacheMutex);
+		gArchiveRetryPathCache[ansiPath] = result;
+	}
+	return result;
 }
 
 struct ZipEntryInfo
@@ -2983,21 +3316,25 @@ bool ExtractZipEntry( const std::wstring& path, long index, HLOCAL* outputHandle
 {
 	if( !outputHandle || index < 0 ) return false;
 	static std::mutex cacheMutex;
-	static std::map<std::wstring, std::vector<ZipEntryInfo>> cache;
-	std::vector<ZipEntryInfo> entries;
+	using ZipIndex = std::vector<ZipEntryInfo>;
+	static std::map<std::wstring, std::shared_ptr<const ZipIndex>> cache;
+	std::shared_ptr<const ZipIndex> entries;
 	{
 		std::lock_guard<std::mutex> lock(cacheMutex);
 		auto found = cache.find(path);
 		if( found != cache.end() ) entries = found->second;
 	}
-	if( entries.empty() )
+	if( !entries )
 	{
-		if( !BuildZipIndex(path, entries) ) return false;
+		auto built = std::make_shared<ZipIndex>();
+		if( !BuildZipIndex(path, *built) ) return false;
+		entries = built;
 		std::lock_guard<std::mutex> lock(cacheMutex);
-		cache[path] = entries;
+		auto inserted = cache.emplace(path, entries);
+		if( !inserted.second ) entries = inserted.first->second;
 	}
-	if( (size_t)index >= entries.size() ) return false;
-	const ZipEntryInfo& entry = entries[(size_t)index];
+	if( (size_t)index >= entries->size() ) return false;
+	const ZipEntryInfo& entry = (*entries)[(size_t)index];
 	if( entry.uncompressedSize > (256u * 1024u * 1024u) ) return false;
 
 	HANDLE file = Utility::CreateFileWLong(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -3036,7 +3373,7 @@ void LogPluginPath( const char* api, LPCSTR input, const char* alias,
 	static std::atomic<int> count = 0;
 	if( count.fetch_add(1) >= 100000 ) return;
 	FILE* lf = nullptr;
-	if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+	if( Utility::OpenDebugLog(&lf) )
 	{
 		fprintf(lf, "plugin %s module=[%s] input=[%s] alias=[%s] first=%d second=%d\n",
 			api, module ? module : "", input ? input : "<null>", alias ? alias : "",
@@ -3381,7 +3718,7 @@ int __stdcall IsSupportedDispatchImpl(ImagePluginCallContext* context, LPSTR Fil
 #if UNICODEHACK_PATH_DEBUG
 	{
 		FILE* lf = nullptr;
-		if( fopen_s(&lf, Utility::GetPathDebugLogPath(), "a") == 0 && lf )
+		if( Utility::OpenDebugLog(&lf) )
 		{
 			fprintf(lf, "IsSupported module=[%s] Filename=[%s] Dw=%lu ret=%d\n",
 				context->moduleName, (Dw < 0x10000 && Filename) ? Filename : "<buffer-or-null>",
@@ -3855,9 +4192,12 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 		{
 			Profile.reset( new ProfileAccessor( hModule ) );
 			ArchivePluginName = Profile->Get("Archive","FileName", "ax7z.spi");
+		#if UNICODEHACK_PATH_DEBUG || UNICODEHACK_PLUGIN_DEBUG
+			Utility::gDebugLogEnabled = Profile->Get("Debug", "DebugLog", UINT()) != 0;
+		#endif
 		}
 
-		if(Profile->Get( "Option", "HookFindFirstFile", UINT() ) )
+		if(Profile->Get( "Option", "HookFindFirstFile", 1 ) )
 		{//��������L���ɂ���ƒZ���p�X�ŕ\������邽�ߏ��Ԃ��ς�����茩�h���Ďg���ɂ��������Ƀv���O�C����I�΂Ȃ�
 			Kernel32::hookFindFirstFile();
 			Kernel32::hookFindNextFile();
@@ -3873,16 +4213,19 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 			Kernel32::hookGetFileAttributesExW();
 			Kernel32::hookFileOperations();
 		}
-		if( Profile->Get("Option","HookSetWindowText",UINT() ) )
+		if( Profile->Get("Option","HookSetWindowText",1 ) )
 		{
 			User32::hookSetWindowTextA();
 		}
-		User32::hookTextDrawing();
+		if( Profile->Get("Option", "HookTextDrawing", 1) )
+		{
+			User32::hookTextDrawing();
+		}
 		//�p�X�Ɖ摜�t�@�C������Unicode�Ȃ炱�ꂾ���ł����邪���Ƀt�@�C�����ʖ�
 		Shell32::hookSHBindToParent();
 		//���Ƀv���O�C�����t�b�N���邱�ƂŃv���O�C���{�̘M�炸�ɑΉ�
 		SusieAM00::hookGetProcAddress();
-		if( Profile->Get("Option","HookCreateMutex",UINT() ) )
+		if( Profile->Get("Option","HookCreateMutex",1 ) )
 		{//���d�N��������
 			Kernel32::hookCreateMutexA();
 		}
@@ -3903,4 +4246,3 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 	}
 	return TRUE;
 }
-

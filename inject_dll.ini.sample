@@ -1,9 +1,0 @@
-[Archive]
-FileName=ax7z.spi
-[Option]
-;0:無効	1:有効
-;書庫ファイルを短いファイル名で表示する、ツリーの誤動作が減るが名前のソートで位置がずれる
-HookFindFirstFile=1
-;多重起動を許す
-HookCreateMutex=1
-HookSetWindowText=1
