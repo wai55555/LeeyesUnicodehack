@@ -332,6 +332,13 @@ std::wstring GetWidePath( std::string Path )
 	std::wstring syntheticPath;
 	if( LookupSyntheticPathAlias(Path, syntheticPath) ) return syntheticPath;
 
+	if( Path.find('?') != std::string::npos )
+	{
+		std::lock_guard<std::mutex> lock(gWidePathCacheMutex);
+		auto it = gWidePathCache.find( Path );
+		if( it != gWidePathCache.end() ) return it->second;
+	}
+
 	// A CP932 conversion can turn an actual Unicode name into both '?' and a
 	// best-fit spelling such as U+00B7 -> U+30FB. Resolve those lossy paths
 	// against the real directory entries before the legacy wildcard fallback
@@ -339,13 +346,10 @@ std::wstring GetWidePath( std::string Path )
 	std::wstring collisionPath;
 	if( Path.find('?') != std::string::npos && Path.find('*') == std::string::npos
 		&& ResolveAnsiPathCollision(Path, collisionPath) )
-		return collisionPath;
-
-	if( Path.find('?') != std::string::npos )
 	{
 		std::lock_guard<std::mutex> lock(gWidePathCacheMutex);
-		auto it = gWidePathCache.find( Path );
-		if( it != gWidePathCache.end() ) return it->second;
+		gWidePathCache[Path] = collisionPath;
+		return collisionPath;
 	}
 
 	std::wstring settled_path ;
@@ -2938,6 +2942,8 @@ GetArchiveInfoAM00FPtr originalGetArchiveInfo = nullptr;
 GetFileAM00FPtr originalGetFile = nullptr;
 std::map<std::string, std::wstring> gArchiveWidePathCache;
 std::mutex gArchiveWidePathCacheMutex;
+std::map<std::string, std::string> gArchiveRetryPathCache;
+std::mutex gArchiveRetryPathCacheMutex;
 
 bool NeedsArchivePathAlias( LPCSTR path )
 {
@@ -2975,20 +2981,38 @@ std::wstring GetArchiveWidePath( LPCSTR path )
 
 std::string GetArchiveRetryPath( LPCSTR path )
 {
+	if( !path ) return std::string();
+	std::string ansiPath(path);
+	{
+		std::lock_guard<std::mutex> lock(gArchiveRetryPathCacheMutex);
+		auto it = gArchiveRetryPathCache.find(ansiPath);
+		if( it != gArchiveRetryPathCache.end() ) return it->second;
+	}
+
 	std::wstring widePath = GetArchiveWidePath(path);
-	if( widePath.empty() ) return std::string();
+	std::string result;
+	if( !widePath.empty() )
+	{
+		// If CP932 gives us a unique real directory entry, keep the plugin on the
+		// user's actual path. The A/W file hooks repair the lossy CP932 spelling at
+		// the filesystem boundary, so no TEMP alias is needed when it is unique.
+		std::string directPath;
+		std::wstring collisionPath;
+		if( Utility::WideToCP932BestFit(widePath, directPath)
+			&& Utility::ResolveAnsiPathCollision(directPath, collisionPath)
+			&& collisionPath == widePath )
+			result = directPath;
+		else
+			result = Utility::GetArchivePathAlias( widePath );
+	}
 
-	// If CP932 gives us a unique real directory entry, keep the plugin on the
-	// user's actual path. The A/W file hooks repair the lossy CP932 spelling at
-	// the filesystem boundary, so no TEMP alias is needed when it is unique.
-	std::string directPath;
-	std::wstring collisionPath;
-	if( Utility::WideToCP932BestFit(widePath, directPath)
-		&& Utility::ResolveAnsiPathCollision(directPath, collisionPath)
-		&& collisionPath == widePath )
-		return directPath;
-
-	return Utility::GetArchivePathAlias( widePath );
+	// Cache failures as well as successful paths. Otherwise a plugin that asks
+	// for the same unavailable path repeatedly would repeat the collision scan.
+	{
+		std::lock_guard<std::mutex> lock(gArchiveRetryPathCacheMutex);
+		gArchiveRetryPathCache[ansiPath] = result;
+	}
+	return result;
 }
 
 struct ZipEntryInfo
@@ -3292,21 +3316,25 @@ bool ExtractZipEntry( const std::wstring& path, long index, HLOCAL* outputHandle
 {
 	if( !outputHandle || index < 0 ) return false;
 	static std::mutex cacheMutex;
-	static std::map<std::wstring, std::vector<ZipEntryInfo>> cache;
-	std::vector<ZipEntryInfo> entries;
+	using ZipIndex = std::vector<ZipEntryInfo>;
+	static std::map<std::wstring, std::shared_ptr<const ZipIndex>> cache;
+	std::shared_ptr<const ZipIndex> entries;
 	{
 		std::lock_guard<std::mutex> lock(cacheMutex);
 		auto found = cache.find(path);
 		if( found != cache.end() ) entries = found->second;
 	}
-	if( entries.empty() )
+	if( !entries )
 	{
-		if( !BuildZipIndex(path, entries) ) return false;
+		auto built = std::make_shared<ZipIndex>();
+		if( !BuildZipIndex(path, *built) ) return false;
+		entries = built;
 		std::lock_guard<std::mutex> lock(cacheMutex);
-		cache[path] = entries;
+		auto inserted = cache.emplace(path, entries);
+		if( !inserted.second ) entries = inserted.first->second;
 	}
-	if( (size_t)index >= entries.size() ) return false;
-	const ZipEntryInfo& entry = entries[(size_t)index];
+	if( (size_t)index >= entries->size() ) return false;
+	const ZipEntryInfo& entry = (*entries)[(size_t)index];
 	if( entry.uncompressedSize > (256u * 1024u * 1024u) ) return false;
 
 	HANDLE file = Utility::CreateFileWLong(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
