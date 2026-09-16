@@ -240,11 +240,15 @@ namespace Utility
 	}
 
 	bool gDebugLogEnabled = false;
+	static thread_local bool gOpeningDebugLog = false;
 
 	bool OpenDebugLog( FILE** log )
 	{
-		if( !gDebugLogEnabled || !log ) return false;
-		return fopen_s( log, GetPathDebugLogPath(), "a" ) == 0 && *log;
+		if( !gDebugLogEnabled || !log || gOpeningDebugLog ) return false;
+		gOpeningDebugLog = true;
+		errno_t result = fopen_s( log, GetPathDebugLogPath(), "a" );
+		gOpeningDebugLog = false;
+		return result == 0 && *log;
 	}
 
 	// Leeyes and the old Susie APIs remain MAX_PATH/ANSI based, but the real
