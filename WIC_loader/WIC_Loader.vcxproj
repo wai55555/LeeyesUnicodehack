@@ -60,7 +60,7 @@
       <ModuleDefinitionFile>wic_loader.def</ModuleDefinitionFile>
     </Link>
     <PostBuildEvent>
-      <Command>copy "$(OutputPath)$(TargetFileName)" "$(SolutionDir)Leeyes_debug\"</Command>
+      <Command>if not exist "$(SolutionDir)Leeyes_debug\" mkdir "$(SolutionDir)Leeyes_debug"&#xD;&#xA;copy "$(OutputPath)$(TargetFileName)" "$(SolutionDir)Leeyes_debug\"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">

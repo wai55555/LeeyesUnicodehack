@@ -4197,7 +4197,7 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 		#endif
 		}
 
-		if(Profile->Get( "Option", "HookFindFirstFile", UINT() ) )
+		if(Profile->Get( "Option", "HookFindFirstFile", 1 ) )
 		{//��������L���ɂ���ƒZ���p�X�ŕ\������邽�ߏ��Ԃ��ς�����茩�h���Ďg���ɂ��������Ƀv���O�C����I�΂Ȃ�
 			Kernel32::hookFindFirstFile();
 			Kernel32::hookFindNextFile();
@@ -4213,7 +4213,7 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 			Kernel32::hookGetFileAttributesExW();
 			Kernel32::hookFileOperations();
 		}
-		if( Profile->Get("Option","HookSetWindowText",UINT() ) )
+		if( Profile->Get("Option","HookSetWindowText",1 ) )
 		{
 			User32::hookSetWindowTextA();
 		}
@@ -4225,7 +4225,7 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 		Shell32::hookSHBindToParent();
 		//���Ƀv���O�C�����t�b�N���邱�ƂŃv���O�C���{�̘M�炸�ɑΉ�
 		SusieAM00::hookGetProcAddress();
-		if( Profile->Get("Option","HookCreateMutex",UINT() ) )
+		if( Profile->Get("Option","HookCreateMutex",1 ) )
 		{//���d�N��������
 			Kernel32::hookCreateMutexA();
 		}
