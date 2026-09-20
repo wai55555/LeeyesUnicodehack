@@ -69,8 +69,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <SubSystem>Windows</SubSystem>
       <TargetMachine>MachineX86</TargetMachine>
-      <ModuleDefinitionFile>
-      </ModuleDefinitionFile>
+      <ModuleDefinitionFile>leeyes_internal\exports.def</ModuleDefinitionFile>
       <ImageHasSafeExceptionHandlers>false</ImageHasSafeExceptionHandlers>
     </Link>
     <PostBuildEvent>
@@ -99,8 +98,7 @@
       <OptimizeReferences>true</OptimizeReferences>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <TargetMachine>MachineX86</TargetMachine>
-      <ModuleDefinitionFile>
-      </ModuleDefinitionFile>
+      <ModuleDefinitionFile>leeyes_internal\exports.def</ModuleDefinitionFile>
     </Link>
     <PostBuildEvent>
       <Command>copy "$(OutputPath)$(TargetFileName)" "$(SolutionDir)Leeyes\"</Command>
@@ -124,6 +122,13 @@
     </ClCompile>
     <ClCompile Include="..\NCodeHook\NCodeHook.cpp" />
     <ClCompile Include="..\NCodeHook\NCodeHookItem.cpp" />
+    <ClCompile Include="leeyes_internal\target_resolver.cpp" />
+    <ClCompile Include="leeyes_internal\trace_buffer.cpp" />
+    <ClCompile Include="leeyes_internal\filelist_trace.cpp" />
+    <ClCompile Include="leeyes_internal\file_move_batch.cpp" />
+    <ClCompile Include="leeyes_internal\delphi_bridge_x86.cpp" />
+    <ClCompile Include="leeyes_internal\hook_runtime.cpp" />
+    <ClCompile Include="leeyes_internal\ncodehook_bridge.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="stdafx.h" />
@@ -131,6 +136,13 @@
     <ClInclude Include="..\NCodeHook\NCodeHook.h" />
     <ClInclude Include="..\NCodeHook\NCodeHookInstantiation.h" />
     <ClInclude Include="..\NCodeHook\NCodeHookItem.h" />
+    <ClInclude Include="leeyes_internal\target_resolver.h" />
+    <ClInclude Include="leeyes_internal\trace_buffer.h" />
+    <ClInclude Include="leeyes_internal\filelist_trace.h" />
+    <ClInclude Include="leeyes_internal\file_move_batch.h" />
+    <ClInclude Include="leeyes_internal\delphi_bridge_x86.h" />
+    <ClInclude Include="leeyes_internal\hook_runtime.h" />
+    <ClInclude Include="leeyes_internal\ncodehook_bridge.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

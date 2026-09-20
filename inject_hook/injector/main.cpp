@@ -3,6 +3,7 @@
 
 #include "stdafx.h"
 #include <iostream>
+#include <vector>
 #include <../NInjectLib/Process.h>
 #include <ShlObj.h>
 
@@ -12,26 +13,97 @@
 
 // TargetID: �v���Z�XID
 // �߂�l: ���� �]�݂�HWND / ���s NULL
+bool IsBackgroundLaunch()
+{
+	_TCHAR value[8] = {};
+	DWORD length = GetEnvironmentVariable(TEXT("LEYEESW_BACKGROUND"), value, _countof(value));
+	return length == 1 && value[0] == TEXT('1');
+}
+
+struct WindowSearchContext
+{
+	DWORD processId;
+	bool includeHidden;
+	HWND result;
+};
+
+BOOL CALLBACK FindMainFormWindow(HWND hWnd, LPARAM parameter)
+{
+	WindowSearchContext* context = reinterpret_cast<WindowSearchContext*>(parameter);
+	DWORD processId = 0;
+	GetWindowThreadProcessId(hWnd, &processId);
+	if( processId != context->processId
+		|| (!context->includeHidden && !IsWindowVisible(hWnd)) ) return TRUE;
+	TCHAR className[256] = {};
+	GetClassName(hWnd, className, _countof(className));
+	if( _tcscmp(className, TEXT("TMainForm")) == 0 )
+	{
+		context->result = hWnd;
+		return FALSE;
+	}
+	return TRUE;
+}
+
 HWND GetWindowHandle(	const DWORD TargetID)	
 {
-	HWND hWnd = GetTopWindow(NULL);
-	do {
-		if(GetWindowLong( hWnd, GWL_HWNDPARENT) != 0 || !IsWindowVisible( hWnd))
-			continue;
-		DWORD ProcessID;
-		GetWindowThreadProcessId( hWnd, &ProcessID);
-		if(TargetID == ProcessID)
-		{
-			TCHAR className[256] = {};
-			GetClassName(hWnd, className, _countof(className));
-			// Delphi creates several visible top-level windows during startup.  Only
-			// the stable TMainForm owns Leeyes' WM_DROPFILES handler; a splash/helper
-			// window can disappear between discovery and PostMessage.
-			if( _tcscmp(className, TEXT("TMainForm")) == 0 ) return hWnd;
-		}
-	} while((hWnd = GetNextWindow( hWnd, GW_HWNDNEXT)) != NULL);
+	WindowSearchContext context = { TargetID, IsBackgroundLaunch(), NULL };
+	EnumWindows(FindMainFormWindow, reinterpret_cast<LPARAM>(&context));
+	return context.result;
+}
 
-	return NULL;
+static void AppendDword(std::vector<BYTE>& code, DWORD value)
+{
+	for( unsigned int shift = 0; shift < 32; shift += 8 )
+		code.push_back(static_cast<BYTE>((value >> shift) & 0xFF));
+}
+
+static void AppendPushImmediate(std::vector<BYTE>& code, DWORD value)
+{
+	code.push_back(0x68);
+	AppendDword(code, value);
+}
+
+static LPVOID CreatePreEntryBootstrap(Process& process, LPVOID remoteDllPath,
+	DWORD originalEntryPoint, LPVOID loadLibrary, LPVOID getProcAddress)
+{
+	static const char initName[] = "InitializeLeeyesInternalHooks";
+	LPVOID remoteInitName = process.allocMem(sizeof(initName));
+	process.writeMemory(remoteInitName, initName, sizeof(initName));
+
+	std::vector<BYTE> code;
+	AppendPushImmediate(code, static_cast<DWORD>(reinterpret_cast<uintptr_t>(remoteDllPath)));
+	code.push_back(0xB8); // mov eax, LoadLibraryW
+	AppendDword(code, static_cast<DWORD>(reinterpret_cast<uintptr_t>(loadLibrary)));
+	code.push_back(0xFF); code.push_back(0xD0); // call eax
+	code.push_back(0x85); code.push_back(0xC0); // test eax, eax
+	code.push_back(0x74);
+	size_t firstJumpDisplacement = code.size();
+	code.push_back(0);
+	AppendPushImmediate(code, static_cast<DWORD>(reinterpret_cast<uintptr_t>(remoteInitName)));
+	code.push_back(0x50); // push the HMODULE returned by LoadLibraryW
+	code.push_back(0xB8); // mov eax, GetProcAddress
+	AppendDword(code, static_cast<DWORD>(reinterpret_cast<uintptr_t>(getProcAddress)));
+	code.push_back(0xFF); code.push_back(0xD0); // call eax
+	code.push_back(0x85); code.push_back(0xC0); // test init export
+	code.push_back(0x74);
+	size_t secondJumpDisplacement = code.size();
+	code.push_back(0);
+	code.push_back(0xFF); code.push_back(0xD0); // call InitializeLeeyesInternalHooks
+	size_t entryJump = code.size();
+	code.push_back(0xBA); // mov edx, original entry point
+	AppendDword(code, originalEntryPoint);
+	code.push_back(0xFF); code.push_back(0xE2); // jmp edx
+
+	for( size_t displacement : { firstJumpDisplacement, secondJumpDisplacement } )
+	{
+		int value = static_cast<int>(entryJump) - static_cast<int>(displacement + 1);
+		if( value < -128 || value > 127 ) throw std::exception("bootstrap jump out of range");
+		code[displacement] = static_cast<BYTE>(static_cast<signed char>(value));
+	}
+
+	LPVOID remoteCode = process.allocMem(static_cast<DWORD>(code.size()));
+	process.writeMemory(remoteCode, code.data(), static_cast<DWORD>(code.size()));
+	return remoteCode;
 }
 
 
@@ -48,6 +120,7 @@ int _tmain(int argc, _TCHAR* argv[])
 
 	LPCTSTR exe = TEXT("Leeyes.exe");
 	LPCTSTR dll = TEXT("inject_dll.dll");
+	bool backgroundLaunch = IsBackgroundLaunch();
 
 	TCHAR path[MAX_PATH]={};
 	TCHAR current_dir[MAX_PATH]={};
@@ -77,7 +150,16 @@ int _tmain(int argc, _TCHAR* argv[])
 
 	STARTUPINFO sInfo = {0};
 	sInfo.cb = sizeof(STARTUPINFO);
-	PROCESS_INFORMATION pInfo= {0};	
+	HWND previousForeground = backgroundLaunch ? ::GetForegroundWindow() : NULL;
+	if( backgroundLaunch )
+	{
+		// Keep the diagnostic target minimized without activation.  The original
+		// foreground window is restored after Leeyes' startup settles so the
+		// minimized target cannot take the user's focus.
+		sInfo.dwFlags |= STARTF_USESHOWWINDOW;
+		sInfo.wShowWindow = SW_SHOWMINNOACTIVE;
+	}
+	PROCESS_INFORMATION pInfo= {0};
 	LPTSTR option = argv[1];
 
 	if (CreateProcess(path, NULL, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, current_dir, &sInfo, &pInfo))
@@ -115,14 +197,14 @@ int _tmain(int argc, _TCHAR* argv[])
 			ctx.ContextFlags = CONTEXT_CONTROL;
 			if (!GetThreadContext(pInfo.hThread, &ctx)) throw std::exception("GetThreadContext failed");
 
-			// lay out the stack exactly as if LoadLibraryW(dllFullPath) had just been called:
-			// [esp] = return address (the real entry point), [esp+4] = the stdcall argument
-			DWORD stackArgs[2] = { originalEntryPoint, (DWORD)remoteDllPath };
-			DWORD newEsp = ctx.Esp - sizeof(stackArgs);
-			process.writeMemory((LPVOID)newEsp, stackArgs, sizeof(stackArgs));
-
-			ctx.Esp = newEsp;
-			ctx.Eip = (DWORD)pLoadLibrary;
+			LPVOID pGetProcAddress = reinterpret_cast<LPVOID>(GetProcAddress(
+				hKernel32, "GetProcAddress"));
+			if( !pGetProcAddress ) throw std::exception("Cant Resolve GetProcAddress");
+			// Keep the primary thread suspended while LoadLibraryW returns and the
+			// exported internal-hook initializer runs outside loader lock. The stub
+			// then jumps to the original entry point without changing its startup stack.
+			ctx.Eip = reinterpret_cast<DWORD>(CreatePreEntryBootstrap(
+				process, remoteDllPath, originalEntryPoint, pLoadLibrary, pGetProcAddress));
 			if (!SetThreadContext(pInfo.hThread, &ctx)) throw std::exception("SetThreadContext failed");
 
 			ResumeThread(pInfo.hThread);
@@ -138,18 +220,30 @@ int _tmain(int argc, _TCHAR* argv[])
 				HWND hwnd = NULL;
 				TCHAR windowTitle[256] = {};
 				TCHAR windowClass[256] = {};
-				DWORD count = 0;
+				// A large folder can keep Leeyes in its startup/list-building phase for
+				// longer than the old 20-second polling limit.  Do not turn that normal
+				// startup delay into a false injection failure.  The process handle is
+				// checked on every pass so a real early exit still fails promptly.
+				const ULONGLONG windowWaitStarted = GetTickCount64();
+				const ULONGLONG windowWaitLimit = 120000;
 				for(;;)
 				{
 					hwnd = GetWindowHandle( pInfo.dwProcessId);
 					if( hwnd )
 					{
 						GetWindowText(hwnd, windowTitle, _countof(windowTitle));
-						if( windowTitle[0] != TEXT('\0') ) break;
+						// The diagnostic path includes hidden windows and only needs a
+						// stable HWND for WM_DROPFILES; the normal path retains the title
+						// check used by the original launcher.
+						if( backgroundLaunch || windowTitle[0] != TEXT('\0') ) break;
 					}
-					if( count++ > 1000 )
+					if( WaitForSingleObject(pInfo.hProcess, 0) == WAIT_OBJECT_0 )
 					{
-						throw std::exception("GetWindowHandle  Time Out");
+						throw std::exception("Leeyes exited before TMainForm was created");
+					}
+					if( GetTickCount64() - windowWaitStarted >= windowWaitLimit )
+					{
+						throw std::exception("TMainForm wait timed out after 120 seconds");
 					}
 					Sleep(20);
 				}
@@ -175,6 +269,8 @@ int _tmain(int argc, _TCHAR* argv[])
 					}
 				}
 				hwnd = stableHwnd;
+				if( backgroundLaunch && previousForeground && ::IsWindow(previousForeground) )
+					::SetForegroundWindow(previousForeground);
 				GetClassName(hwnd, windowClass, _countof(windowClass));
 				#ifdef UNICODE
 				std::wcout << L"DROP_TARGET hwnd=" << hwnd << L" title=[" << windowTitle << L"] class=[" << windowClass << L"]" << std::endl;
