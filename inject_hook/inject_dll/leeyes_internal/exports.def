@@ -1,0 +1,3 @@
+LIBRARY inject_dll
+EXPORTS
+    InitializeLeeyesInternalHooks=_InitializeLeeyesInternalHooks@0

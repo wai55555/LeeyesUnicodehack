@@ -22,6 +22,8 @@ Win32/
 # is a local staging copy, not source - never commit it from here.
 /Leeyes/*
 /Leeyes_debug/*
+/test*/
+/test_img/*
 
 # Local development area for the Leeyes image sorter. Keep only the public README tracked.
 leeyes-image-sorter/

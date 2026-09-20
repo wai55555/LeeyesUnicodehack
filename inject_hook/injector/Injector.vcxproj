@@ -98,9 +98,13 @@
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="main.cpp" />
+    <ClCompile Include="main.cpp">
+      <AdditionalOptions>/source-charset:utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
     <ClCompile Include="stdafx.cpp" />
-    <ClCompile Include="..\NInjectLib\GenericInjector.cpp" />
+    <ClCompile Include="..\NInjectLib\GenericInjector.cpp">
+      <AdditionalOptions>/source-charset:.1252 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
     <ClCompile Include="..\NInjectLib\IATModifier.cpp" />
     <ClCompile Include="..\NInjectLib\InjectLib.cpp" />
     <ClCompile Include="..\NInjectLib\Process.cpp" />
