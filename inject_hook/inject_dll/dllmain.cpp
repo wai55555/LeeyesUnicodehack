@@ -901,7 +901,9 @@ std::string GetFullyAsciiAlias( const std::wstring& path )
 
 	std::string direct;
 	if( WideToCP932(path, direct) && !HasAnsiPathLengthIssue(direct) )
-		return cacheResult(direct);
+		// Direct CP932 paths have no synthetic state to preserve. Do not retain
+		// one cache entry per image when a Unicode directory contains many files.
+		return direct;
 
 	auto slashPos = path.find_last_of( L"\\/" );
 	if( slashPos == std::wstring::npos ) return std::string();
@@ -912,7 +914,10 @@ std::string GetFullyAsciiAlias( const std::wstring& path )
 	if( !isDirectory && WideToCP932(leaf, leafAnsi) )
 	{
 		auto parentAlias = GetPrivateDirectoryAlias( parent );
-		if( !parentAlias.empty() ) return cacheResult(parentAlias + "\\" + leafAnsi);
+		if( !parentAlias.empty() )
+			// The directory alias is cached separately; the per-file concatenation
+			// is deterministic and does not need another unbounded map entry.
+			return parentAlias + "\\" + leafAnsi;
 	}
 
 	// The common WebP/JPG case has an ASCII filename inside a Unicode folder.
@@ -920,7 +925,7 @@ std::string GetFullyAsciiAlias( const std::wstring& path )
 	// image is much slower and provides no additional benefit in that case.
 	auto shortPath = GetShortPathWLong( path );
 	if( !shortPath.empty() && WideToCP932(shortPath, direct) )
-		return cacheResult(direct);
+		return direct;
 
 	std::wstring rootWide;
 	std::string rootAnsi;
@@ -1522,6 +1527,11 @@ bool HasPathLengthIssue( const std::string& parentDirAnsi, LPCSTR leafName )
 	return parentDirAnsi.size() + 1 + strlen(leafName) >= MAX_PATH - 1;
 }
 
+bool IsEnumerationPattern( LPCSTR pattern )
+{
+	return pattern && strpbrk(pattern, "*?") != nullptr;
+}
+
 #if UNICODEHACK_PATH_DEBUG
 void LogFindResult( const char* api, LPCSTR pattern, LPCSTR name )
 {
@@ -1752,6 +1762,7 @@ HANDLE  WINAPI FindFirstFileHook(LPCTSTR lpFileName,  LPWIN32_FIND_DATA lpFindFi
 	bool pathHasUnknown = HasUnknownChar( lpFileName );
 	bool pathHasSynthetic = lpFileName && Utility::HasSyntheticAlias( lpFileName );
 	bool pathNeedsUnicode = pathHasUnknown || pathHasSynthetic;
+	const bool enumerationPattern = IsEnumerationPattern( lpFileName );
 	std::string searchPattern;
 	if( pathNeedsUnicode ) searchPattern = lpFileName;
 
@@ -1787,21 +1798,34 @@ HANDLE  WINAPI FindFirstFileHook(LPCTSTR lpFileName,  LPWIN32_FIND_DATA lpFindFi
 		if( resultSlashPos != std::string::npos )
 			resultParentAnsi = searchPattern.substr( 0, resultSlashPos );
 		bool resultPathTooLong = HasPathLengthIssue(resultParentAnsi, lpFindFileData->cFileName);
-		// The common ASCII/JPG case stays on the original fast path: no map entry,
-		// mutex, or path conversion is created for a normal directory scan.
-		if( pathNeedsUnicode || resultHasUnknown || resultPathTooLong )
+		// A normal ASCII directory search can return a CP932-unrepresentable child
+		// several FindNextFile calls after FindFirstFile. Keep one context for
+		// wildcard enumeration so that later children can be repaired; ordinary
+		// single-file existence checks stay on the original fast path.
+		if( pathNeedsUnicode || resultHasUnknown || resultPathTooLong
+			|| enumerationPattern )
 		{
 			if( searchPattern.empty() ) searchPattern = lpFileName ? lpFileName : "";
 			SearchContext context;
 			auto slashPos = searchPattern.find_last_of( '\\' );
 			if( slashPos != std::string::npos )
 				context.parentDirAnsi = searchPattern.substr( 0, slashPos );
-			if( context.parentDirWide.empty() )
-				ResolveSearchParentDir( context );
 			auto existing = FindSearchContext( ret );
 			if( existing ) context = existing->context;
-			else RememberSearchContext( ret, context );
-			if( !context.wideEnumeration && !context.parentDirWide.empty() )
+			const bool mayNeedFixup = pathNeedsUnicode || resultHasUnknown || resultPathTooLong;
+			if( !context.wideEnumeration && mayNeedFixup )
+			{
+				// Keep the normal wildcard path cheap. Resolve the Unicode parent only
+				// when this result actually needs repair.
+				if( context.parentDirWide.empty() )
+					ResolveSearchParentDir( context );
+				if( !context.parentDirWide.empty() )
+					RememberSearchContext( ret, context );
+			}
+			else if( !existing )
+				RememberSearchContext( ret, context );
+			if( !context.wideEnumeration && mayNeedFixup
+				&& !context.parentDirWide.empty() )
 				FixupFindData( context.parentDirWide, context.parentDirAnsi, lpFindFileData );
 		}
 			#if UNICODEHACK_PATH_DEBUG
@@ -1877,6 +1901,12 @@ BOOL  WINAPI FindNextFileHook(HANDLE hFindFile,       LPWIN32_FIND_DATA lpFindFi
 	else if( ret && hasContext && (HasUnknownChar( lpFindFileData->cFileName )
 		|| HasPathLengthIssue(context.parentDirAnsi, lpFindFileData->cFileName)) )
 	{
+		if( context.parentDirWide.empty() )
+		{
+			ResolveSearchParentDir( context );
+			if( !context.parentDirWide.empty() )
+				RememberSearchContext( hFindFile, context );
+		}
 		FixupFindData( context.parentDirWide, context.parentDirAnsi, lpFindFileData );
 	}
 	DWORD lastError = ret ? ERROR_SUCCESS : ::GetLastError();
