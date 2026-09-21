@@ -1,3 +1,11 @@
+#ifndef UNICODEHACK_PATH_DEBUG
+#define UNICODEHACK_PATH_DEBUG 0
+#endif
+
+#ifndef UNICODEHACK_PLUGIN_DEBUG
+#define UNICODEHACK_PLUGIN_DEBUG 0
+#endif
+
 #include "stdafx.h"
 #include <../NCodeHook/NCodeHookInstantiation.h>
 #ifdef NDEBUG
@@ -17,24 +25,15 @@
 #include <map>
 #include <memory>
 #include <winternl.h>
+#if UNICODEHACK_PLUGIN_DEBUG
+#include <psapi.h>
+#endif
 #include "leeyes_internal/hook_runtime.h"
+#if UNICODEHACK_PLUGIN_DEBUG
+#pragma comment(lib, "psapi.lib")
+#endif
 //#include <concurrent_unordered_set.h>
 //#include <concurrent_unordered_map.h>
-
-// File-level tracing is useful while investigating a new API path, but opening
-// and closing a log file for every image access makes normal thumbnail loading
-// disproportionately slow. The diagnostic build contains it, but the INI
-// switch keeps it disabled unless it is explicitly needed.
-#ifndef UNICODEHACK_PATH_DEBUG
-#define UNICODEHACK_PATH_DEBUG 0
-#endif
-
-// Temporary, narrow diagnostics for image-plugin path failures. This is kept
-// separate from the expensive per-file tracing above and is disabled in the
-// Release build; the diagnostic build uses the same INI switch.
-#ifndef UNICODEHACK_PLUGIN_DEBUG
-#define UNICODEHACK_PLUGIN_DEBUG 0
-#endif
 
 // NOTE: every injected dll has to export at least one symbol - otherwise
 // the OS loader will fail with STATUS_INVALID_IMAGE_FORMAT (0x0C000007B)
@@ -44,6 +43,16 @@ __declspec(dllexport) void dummyExport() {}
 // are deleted when the destructor of nCodeHook is called!
 NCodeHookIA32 nCodeHook;
 HMODULE gInjectedModule = nullptr;
+
+#if UNICODEHACK_PLUGIN_DEBUG
+namespace SusieAM00
+{
+void LogFailureEvent( const char* api, const char* module, LPCSTR input,
+	int firstResult, int finalResult );
+void LogFailureEventW( const char* api, const char* module, LPCWSTR input,
+	int firstResult, int finalResult );
+}
+#endif
 
 namespace Utility
 {
@@ -265,7 +274,29 @@ bool IsBestFitConversion( const std::wstring& wide, const std::string& ansi )
 		return path.c_str();
 	}
 
+	const char* GetFailureDebugLogPath()
+	{
+		static std::string path;
+		if( path.empty() )
+		{
+			char modulePath[MAX_PATH] = {};
+			if( gInjectedModule && ::GetModuleFileNameA(gInjectedModule, modulePath, MAX_PATH) )
+			{
+				char* slash = strrchr( modulePath, '\\' );
+				if( slash )
+				{
+					*(slash + 1) = '\0';
+					path = modulePath;
+					path += "inject_dll_failure_debug.txt";
+				}
+			}
+			if( path.empty() ) path = "inject_dll_failure_debug.txt";
+		}
+		return path.c_str();
+	}
+
 	bool gDebugLogEnabled = false;
+	bool gFailureLogEnabled = false;
 	static thread_local bool gOpeningDebugLog = false;
 
 	bool OpenDebugLog( FILE** log )
@@ -273,6 +304,15 @@ bool IsBestFitConversion( const std::wstring& wide, const std::string& ansi )
 		if( !gDebugLogEnabled || !log || gOpeningDebugLog ) return false;
 		gOpeningDebugLog = true;
 		errno_t result = fopen_s( log, GetPathDebugLogPath(), "a" );
+		gOpeningDebugLog = false;
+		return result == 0 && *log;
+	}
+
+	bool OpenFailureLog( FILE** log )
+	{
+		if( !gFailureLogEnabled || !log || gOpeningDebugLog ) return false;
+		gOpeningDebugLog = true;
+		errno_t result = fopen_s( log, GetFailureDebugLogPath(), "a" );
 		gOpeningDebugLog = false;
 		return result == 0 && *log;
 	}
@@ -1937,6 +1977,63 @@ LPCSTR StripExtendedAnsiPrefix( LPCSTR path )
 	return IsExtendedAnsiPath(path) ? path + 4 : path;
 }
 
+bool IsDiagnosticImageOrArchivePathA( LPCSTR path )
+{
+	if( !path ) return true;
+	const char* slash = strrchr(path, '\\');
+	if( !slash ) slash = strrchr(path, '/');
+	const char* leaf = slash ? slash + 1 : path;
+	if( _stricmp(leaf, "desktop.ini") == 0 || _stricmp(leaf, "Thumbs.db") == 0 ) return false;
+	const char* dot = strrchr(leaf, '.');
+	if( !dot ) return true;
+	static const char* extensions[] = {
+		".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".gif", ".bmp", ".webp", ".avif",
+		".tif", ".tiff", ".tga", ".psd", ".j2k", ".jp2", ".jpf", ".jpm", ".jpx",
+		".bpg", ".tlg", ".mag", ".eri", ".mng", ".pi", ".ugoira", ".webm", ".swf",
+		".flv", ".pdf", ".zip", ".rar", ".7z", ".lzh", ".cbz", ".cbr", nullptr
+	};
+	for( const char** extension = extensions; *extension; ++extension )
+		if( _stricmp(dot, *extension) == 0 ) return true;
+	return false;
+}
+
+bool IsDiagnosticImageOrArchivePathW( LPCWSTR path )
+{
+	if( !path ) return true;
+	const wchar_t* slash = wcsrchr(path, L'\\');
+	const wchar_t* forwardSlash = wcsrchr(path, L'/');
+	if( forwardSlash && (!slash || forwardSlash > slash) ) slash = forwardSlash;
+	const wchar_t* leaf = slash ? slash + 1 : path;
+	if( _wcsicmp(leaf, L"desktop.ini") == 0 || _wcsicmp(leaf, L"Thumbs.db") == 0 ) return false;
+	const wchar_t* dot = wcsrchr(leaf, L'.');
+	if( !dot ) return true;
+	static const wchar_t* extensions[] = {
+		L".jpg", L".jpeg", L".jpe", L".jfif", L".png", L".gif", L".bmp", L".webp", L".avif",
+		L".tif", L".tiff", L".tga", L".psd", L".j2k", L".jp2", L".jpf", L".jpm", L".jpx",
+		L".bpg", L".tlg", L".mag", L".eri", L".mng", L".pi", L".ugoira", L".webm", L".swf",
+		L".flv", L".pdf", L".zip", L".rar", L".7z", L".lzh", L".cbz", L".cbr", nullptr
+	};
+	for( const wchar_t** extension = extensions; *extension; ++extension )
+		if( _wcsicmp(dot, *extension) == 0 ) return true;
+	return false;
+}
+
+bool ShouldLogFileOpenFailureA( LPCSTR path, DWORD lastError )
+{
+	if( !IsDiagnosticImageOrArchivePathA(path) ) return false;
+	if( lastError == ERROR_ACCESS_DENIED && path
+		&& (strstr(path, "\\System Volume Information\\") || strstr(path, "\\Recovery\\")) ) return false;
+	return true;
+}
+
+bool ShouldLogFileOpenFailureW( LPCWSTR path, DWORD lastError )
+{
+	if( !IsDiagnosticImageOrArchivePathW(path) ) return false;
+	if( lastError == ERROR_ACCESS_DENIED && path
+		&& (wcsstr(path, L"\\System Volume Information\\") || wcsstr(path, L"\\Recovery\\")) ) return false;
+	return true;
+}
+
 HANDLE  WINAPI CreateFileAHook(    __in     LPCSTR lpFileName,
     __in     DWORD dwDesiredAccess,
     __in     DWORD dwShareMode,
@@ -2013,6 +2110,15 @@ HANDLE  WINAPI CreateFileAHook(    __in     LPCSTR lpFileName,
 	#endif
 		::SetLastError(lastErr2);
 	}
+#if UNICODEHACK_PLUGIN_DEBUG
+	DWORD failureError = ::GetLastError();
+	if( ret == INVALID_HANDLE_VALUE && ShouldLogFileOpenFailureA(lpFileName, failureError) )
+	{
+		::SetLastError(failureError);
+		SusieAM00::LogFailureEvent("CreateFileA", "kernel32", lpFileName, static_cast<int>(failureError), -1);
+		::SetLastError(failureError);
+	}
+#endif
 	return ret;
 }
 void hookCreateFileA()
@@ -2084,6 +2190,15 @@ HANDLE  WINAPI CreateFileWHook(    __in     LPCWSTR lpFileName,
 			fprintf(lf, "CreateFileW in(utf8)=[%s] ret=%s\n", utf8, (ret != INVALID_HANDLE_VALUE) ? "SUCCESS" : "FAIL");
 			fclose(lf);
 		}
+	}
+	#endif
+#if UNICODEHACK_PLUGIN_DEBUG
+	DWORD failureError = ::GetLastError();
+	if( ret == INVALID_HANDLE_VALUE && ShouldLogFileOpenFailureW(lpFileName, failureError) )
+	{
+		::SetLastError(failureError);
+		SusieAM00::LogFailureEventW("CreateFileW", "kernel32", lpFileName, static_cast<int>(failureError), -1);
+		::SetLastError(failureError);
 	}
 #endif
 	return ret;
@@ -2173,6 +2288,15 @@ HANDLE WINAPI CreateFile2Hook(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD d
 			fprintf(lf, "CreateFile2 in(utf8)=[%s] ret=%s\n", utf8, (ret != INVALID_HANDLE_VALUE) ? "SUCCESS" : "FAIL");
 			fclose(lf);
 		}
+	}
+	#endif
+#if UNICODEHACK_PLUGIN_DEBUG
+	DWORD failureError = ::GetLastError();
+	if( ret == INVALID_HANDLE_VALUE && ShouldLogFileOpenFailureW(lpFileName, failureError) )
+	{
+		::SetLastError(failureError);
+		SusieAM00::LogFailureEventW("CreateFile2", "kernel32", lpFileName, static_cast<int>(failureError), -1);
+		::SetLastError(failureError);
 	}
 #endif
 	return ret;
@@ -2838,6 +2962,64 @@ void hookCreateMutexA()
 
 namespace User32
 {
+	bool IsBackgroundProcess()
+	{
+		char value[8] = {};
+		DWORD length = ::GetEnvironmentVariableA("LEYEESW_BACKGROUND", value, _countof(value));
+		return length == 1 && value[0] == '1';
+	}
+
+	bool IsMainFormWindow(HWND window)
+	{
+		if( !window ) return false;
+		DWORD processId = 0;
+		::GetWindowThreadProcessId(window, &processId);
+		if( processId != ::GetCurrentProcessId() ) return false;
+		HWND root = ::GetAncestor(window, GA_ROOT);
+		char className[64] = {};
+		return root && ::GetClassNameA(root, className, _countof(className)) > 0
+			&& strcmp(className, "TMainForm") == 0;
+	}
+
+	typedef BOOL (WINAPI *SetForegroundWindowFPtr)( HWND hWnd );
+	SetForegroundWindowFPtr originalSetForegroundWindow = nullptr;
+	typedef BOOL (WINAPI *ShowWindowFPtr)( HWND hWnd, int nCmdShow );
+	ShowWindowFPtr originalShowWindow = nullptr;
+	typedef HWND (WINAPI *SetActiveWindowFPtr)( HWND hWnd );
+	SetActiveWindowFPtr originalSetActiveWindow = nullptr;
+	typedef BOOL (WINAPI *BringWindowToTopFPtr)( HWND hWnd );
+	BringWindowToTopFPtr originalBringWindowToTop = nullptr;
+
+	BOOL WINAPI SetForegroundWindowBackgroundHook( HWND window )
+	{
+		if( IsBackgroundProcess() && IsMainFormWindow(window) ) return TRUE;
+		return originalSetForegroundWindow ? originalSetForegroundWindow(window) : FALSE;
+	}
+
+	BOOL WINAPI ShowWindowBackgroundHook( HWND window, int command )
+	{
+		if( IsBackgroundProcess() && IsMainFormWindow(window)
+			&& command != SW_HIDE )
+		{
+			// Keep the diagnostic main form alive while preventing every normal
+			// ShowWindow(SW_SHOW/SW_RESTORE) call from activating the desktop.
+			return originalShowWindow ? originalShowWindow(window, SW_SHOWMINNOACTIVE) : FALSE;
+		}
+		return originalShowWindow ? originalShowWindow(window, command) : FALSE;
+	}
+
+	HWND WINAPI SetActiveWindowBackgroundHook( HWND window )
+	{
+		if( IsBackgroundProcess() && IsMainFormWindow(window) ) return window;
+		return originalSetActiveWindow ? originalSetActiveWindow(window) : nullptr;
+	}
+
+	BOOL WINAPI BringWindowToTopBackgroundHook( HWND window )
+	{
+		if( IsBackgroundProcess() && IsMainFormWindow(window) ) return TRUE;
+		return originalBringWindowToTop ? originalBringWindowToTop(window) : FALSE;
+	}
+
 	typedef BOOL (WINAPI *SetWindowTextAFPtr)( HWND hWnd, LPCSTR lpString );
 	SetWindowTextAFPtr originalSetWindowTextA = nullptr;
 	typedef BOOL (WINAPI *SetWindowTextWFPtr)( HWND hWnd, LPCWSTR lpString );
@@ -3408,6 +3590,19 @@ namespace User32
 				originalSendMessageA ? "OK" : "FAILED", originalSendMessageW ? "OK" : "FAILED");
 			fclose(lf);
 		}
+	}
+
+	void hookBackgroundActivation()
+	{
+		if( !IsBackgroundProcess() ) return;
+		originalSetForegroundWindow = nCodeHook.createHookByName(
+			"user32.dll", "SetForegroundWindow", SetForegroundWindowBackgroundHook);
+		originalShowWindow = nCodeHook.createHookByName(
+			"user32.dll", "ShowWindow", ShowWindowBackgroundHook);
+		originalSetActiveWindow = nCodeHook.createHookByName(
+			"user32.dll", "SetActiveWindow", SetActiveWindowBackgroundHook);
+		originalBringWindowToTop = nCodeHook.createHookByName(
+			"user32.dll", "BringWindowToTop", BringWindowToTopBackgroundHook);
 	}
 }
 
@@ -4318,6 +4513,20 @@ bool ExtractZipEntry( const std::wstring& path, long index, HLOCAL* outputHandle
 	return true;
 }
 
+enum ImagePluginFunction
+{
+	ImagePluginIsSupported,
+	ImagePluginGetPictureInfo,
+	ImagePluginGetPicture
+};
+
+struct ImagePluginCallContext
+{
+	ImagePluginFunction function;
+	FARPROC original;
+	char moduleName[MAX_PATH];
+};
+
 #if UNICODEHACK_PLUGIN_DEBUG
 void LogPluginPath( const char* api, LPCSTR input, const char* alias,
 	int firstResult, int secondResult, const char* module = nullptr )
@@ -4332,6 +4541,244 @@ void LogPluginPath( const char* api, LPCSTR input, const char* alias,
 			firstResult, secondResult);
 		fclose(lf);
 	}
+}
+
+void LogFailureResourceState( FILE* log )
+{
+	if( !log ) return;
+	PROCESS_MEMORY_COUNTERS_EX memory = {};
+	memory.cb = sizeof(memory);
+	if( ::GetProcessMemoryInfo(::GetCurrentProcess(),
+		reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory), sizeof(memory)) )
+	{
+			fprintf(log, "memory private=%llu working=%llu peak_working=%llu pagefile=%llu\n",
+				(unsigned long long)memory.PrivateUsage,
+				(unsigned long long)memory.WorkingSetSize,
+				(unsigned long long)memory.PeakWorkingSetSize,
+				(unsigned long long)memory.PagefileUsage);
+	}
+	SIZE_T largestFree = 0;
+	ULONG_PTR address = 0;
+	for( ;; )
+	{
+		MEMORY_BASIC_INFORMATION information = {};
+		SIZE_T queried = ::VirtualQuery(reinterpret_cast<LPCVOID>(address),
+			&information, sizeof(information));
+		if( queried == 0 ) break;
+		if( information.State == MEM_FREE && information.RegionSize > largestFree )
+			largestFree = information.RegionSize;
+		ULONG_PTR next = reinterpret_cast<ULONG_PTR>(information.BaseAddress)
+			+ information.RegionSize;
+		if( next <= address ) break;
+		address = next;
+	}
+	DWORD handleCount = 0;
+	::GetProcessHandleCount(::GetCurrentProcess(), &handleCount);
+	fprintf(log, "resources largest_free=%llu gdi=%lu user=%lu handles=%lu\n",
+		(unsigned long long)largestFree,
+		(unsigned long)::GetGuiResources(::GetCurrentProcess(), GR_GDIOBJECTS),
+		(unsigned long)::GetGuiResources(::GetCurrentProcess(), GR_USEROBJECTS),
+		(unsigned long)handleCount);
+}
+
+void LogFailureEventText( const char* api, const char* module, const char* input,
+	int firstResult, int finalResult, DWORD lastError )
+{
+	if( !Utility::gFailureLogEnabled || finalResult == SPI_ALL_RIGHT ) return;
+	static std::atomic<unsigned long> failureCount(0);
+	if( failureCount.fetch_add(1, std::memory_order_relaxed) >= 4096 ) return;
+	FILE* log = nullptr;
+	if( !Utility::OpenFailureLog(&log) ) return;
+	char inputText[1024] = {};
+	if( input )
+	{
+		__try
+		{
+			strncpy_s(inputText, _countof(inputText), input, _countof(inputText) - 1);
+		}
+		__except( EXCEPTION_EXECUTE_HANDLER )
+		{
+			strcpy_s(inputText, "<invalid>");
+		}
+	}
+	fprintf(log, "failure t_ms=%llu tid=%lu api=%s module=[%s] first=%d final=%d last_error=%lu input=[%s]\n",
+		(unsigned long long)::GetTickCount64(), (unsigned long)::GetCurrentThreadId(),
+		api ? api : "?", module ? module : "", firstResult, finalResult,
+		(unsigned long)lastError, input ? inputText : "<null>");
+	LogFailureResourceState(log);
+	void* stack[12] = {};
+	USHORT stackCount = ::CaptureStackBackTrace(1, _countof(stack), stack, nullptr);
+	fprintf(log, "stack");
+	for( USHORT index = 0; index < stackCount; ++index )
+		fprintf(log, " %p", stack[index]);
+	fprintf(log, "\n");
+	fclose(log);
+}
+
+void LogFailureEvent( const char* api, const char* module, LPCSTR input,
+	int firstResult, int finalResult )
+{
+	LogFailureEventText(api, module, input, firstResult, finalResult, ::GetLastError());
+}
+
+void LogFailureEventW( const char* api, const char* module, LPCWSTR input,
+	int firstResult, int finalResult )
+{
+	DWORD lastError = ::GetLastError();
+	std::string utf8;
+	if( input )
+	{
+		int length = ::WideCharToMultiByte(CP_UTF8, 0, input, -1, nullptr, 0, nullptr, nullptr);
+		if( length > 1 )
+		{
+			utf8.resize(static_cast<size_t>(length));
+			::WideCharToMultiByte(CP_UTF8, 0, input, -1, &utf8[0], length, nullptr, nullptr);
+			utf8.resize(static_cast<size_t>(length - 1));
+		}
+	}
+	LogFailureEventText(api, module, utf8.empty() ? nullptr : utf8.c_str(),
+		firstResult, finalResult, lastError);
+}
+
+struct ImagePluginPathStat
+{
+	std::string module;
+	std::string api;
+	std::string path;
+	unsigned long long calls = 0;
+	unsigned long long success = 0;
+	unsigned long long failure = 0;
+	int lastResult = 0;
+};
+
+std::mutex gImagePluginDiagnosticsMutex;
+std::map<std::string, ImagePluginPathStat> gImagePluginPathStats;
+std::atomic<unsigned long long> gImagePictureCalls(0);
+std::atomic<unsigned long long> gImagePictureSuccess(0);
+std::atomic<unsigned long long> gImagePictureFailure(0);
+std::atomic<unsigned long long> gImagePictureInfoCalls(0);
+std::atomic<unsigned long long> gImagePictureInfoSuccess(0);
+std::atomic<unsigned long long> gImagePictureInfoFailure(0);
+bool gImagePluginSummaryEnabled = false;
+std::atomic<bool> gImagePluginDiagnosticsStop(false);
+HANDLE gImagePluginDiagnosticsThread = nullptr;
+
+std::string ImagePluginDiagnosticPath()
+{
+	char modulePath[MAX_PATH * 2] = {};
+	if( !gInjectedModule || !::GetModuleFileNameA(gInjectedModule, modulePath, _countof(modulePath)) )
+		return std::string("_image_plugin_debug.txt");
+	char* dot = strrchr(modulePath, '.');
+	if( !dot ) return std::string("_image_plugin_debug.txt");
+	strcpy_s(dot, _countof(modulePath) - static_cast<size_t>(dot - modulePath),
+		"_image_plugin_debug.txt");
+	return std::string(modulePath);
+}
+
+unsigned long ImagePluginPathHash( const std::string& path )
+{
+	unsigned long hash = 2166136261u;
+	for( unsigned char value : path )
+	{
+		hash ^= value;
+		hash *= 16777619u;
+	}
+	return hash;
+}
+
+void RecordImagePluginCall( ImagePluginCallContext* context, const char* api,
+	LPCSTR input, unsigned int flag, int result )
+{
+	if( !context || !api ) return;
+	const bool summaryEnabled = gImagePluginSummaryEnabled;
+	if( Utility::gDebugLogEnabled || summaryEnabled )
+	{
+		if( Utility::gDebugLogEnabled )
+		{
+			const bool pathCall = (flag & 0x07) == 0 && input != nullptr;
+			std::string path = pathCall ? std::string(input) : std::string("<buffer>");
+			if( path.size() > 4095 ) path.resize(4095);
+			std::string module = context->moduleName;
+			std::string key = module + "\n" + api + "\n" + path;
+			std::lock_guard<std::mutex> lock(gImagePluginDiagnosticsMutex);
+			auto& item = gImagePluginPathStats[key];
+			if( item.calls == 0 )
+			{
+				item.module = module;
+				item.api = api;
+				item.path = path;
+			}
+			++item.calls;
+			item.lastResult = result;
+			if( result == SPI_ALL_RIGHT ) ++item.success;
+			else ++item.failure;
+		}
+		const bool success = result == SPI_ALL_RIGHT;
+		if( strcmp(api, "GetPicture") == 0 )
+		{
+			++gImagePictureCalls;
+			if( success ) ++gImagePictureSuccess;
+			else ++gImagePictureFailure;
+		}
+		else
+		{
+			++gImagePictureInfoCalls;
+			if( success ) ++gImagePictureInfoSuccess;
+			else ++gImagePictureInfoFailure;
+		}
+	}
+	if( result != SPI_ALL_RIGHT ) LogFailureEvent(api, context->moduleName, input, result, result);
+}
+
+void WriteImagePluginDiagnostics()
+{
+	if( !Utility::gDebugLogEnabled && !gImagePluginSummaryEnabled ) return;
+	FILE* log = nullptr;
+	const std::string path = ImagePluginDiagnosticPath();
+	if( fopen_s(&log, path.c_str(), "w") != 0 || !log ) return;
+	fprintf(log, "image_diag version=1\n");
+	fprintf(log, "picture calls=%llu success=%llu failure=%llu\n",
+		gImagePictureCalls.load(), gImagePictureSuccess.load(), gImagePictureFailure.load());
+	fprintf(log, "picture_info calls=%llu success=%llu failure=%llu\n",
+		gImagePictureInfoCalls.load(), gImagePictureInfoSuccess.load(), gImagePictureInfoFailure.load());
+	if( Utility::gDebugLogEnabled )
+	{
+		std::lock_guard<std::mutex> lock(gImagePluginDiagnosticsMutex);
+		for( const auto& pair : gImagePluginPathStats )
+		{
+			const auto& item = pair.second;
+			fprintf(log, "path module=[%s] api=[%s] hash=%08lX calls=%llu success=%llu failure=%llu last=%d input=[%s]\n",
+				item.module.c_str(), item.api.c_str(), ImagePluginPathHash(item.path),
+				item.calls, item.success, item.failure, item.lastResult, item.path.c_str());
+		}
+	}
+	fclose(log);
+}
+
+DWORD WINAPI ImagePluginDiagnosticsThreadProc( LPVOID )
+{
+	while( !gImagePluginDiagnosticsStop.load(std::memory_order_acquire) )
+	{
+		::Sleep(1000);
+		if( !gImagePluginDiagnosticsStop.load(std::memory_order_acquire) )
+			WriteImagePluginDiagnostics();
+	}
+	WriteImagePluginDiagnostics();
+	return 0;
+}
+
+void StartImagePluginDiagnostics()
+{
+	if( (!Utility::gDebugLogEnabled && !gImagePluginSummaryEnabled)
+		|| gImagePluginDiagnosticsThread ) return;
+	gImagePluginDiagnosticsStop.store(false, std::memory_order_release);
+	gImagePluginDiagnosticsThread = ::CreateThread(nullptr, 0,
+		&ImagePluginDiagnosticsThreadProc, nullptr, 0, nullptr);
+}
+
+void StopImagePluginDiagnostics()
+{
+	gImagePluginDiagnosticsStop.store(true, std::memory_order_release);
 }
 
 #endif
@@ -4349,6 +4796,8 @@ int __stdcall GetArchiveInfoHook(LPSTR Buf, long Len, unsigned int Flag, HLOCAL 
 	}
 #if UNICODEHACK_PLUGIN_DEBUG
 	LogPluginPath( "GetArchiveInfo", Buf, retryPath.c_str(), originalResult, ret, "archive" );
+	if( ret != SPI_ALL_RIGHT )
+		LogFailureEvent( "GetArchiveInfo", "archive", Buf, originalResult, ret );
 #endif
 	return ret;
 }
@@ -4366,6 +4815,8 @@ int __stdcall GetFileHook(LPSTR Src, long Len, LPSTR Dst, unsigned int Flag, SPI
 	}
 #if UNICODEHACK_PLUGIN_DEBUG
 	LogPluginPath( "GetFile", Src, retryPath.c_str(), originalResult, ret, "archive" );
+	if( ret != SPI_ALL_RIGHT )
+		LogFailureEvent( "GetFile", "archive", Src, originalResult, ret );
 #endif
 	return ret;
 }
@@ -4424,6 +4875,8 @@ int __stdcall ArchiveFileInfoDispatchImpl(ArchivePluginCallContext* context, LPS
 	char nameInfo[MAX_PATH * 2] = {};
 	sprintf_s(nameInfo, "filename=%s", Filename ? Filename : "<null>");
 	LogPluginPath( "GetFileInfo", Buf, retryPath.empty() ? nameInfo : retryPath.c_str(), originalResult, ret, context->moduleName );
+	if( ret != SPI_ALL_RIGHT )
+		LogFailureEvent( "GetFileInfo", context->moduleName, Buf, originalResult, ret );
 #endif
 	return ret;
 }
@@ -4444,6 +4897,8 @@ int __stdcall ArchiveInfoDispatchImpl(ArchivePluginCallContext* context, LPSTR B
 	}
 #if UNICODEHACK_PLUGIN_DEBUG
 	LogPluginPath( "GetArchiveInfo", Buf, retryPath.c_str(), originalResult, ret, context->moduleName );
+	if( ret != SPI_ALL_RIGHT )
+		LogFailureEvent( "GetArchiveInfo", context->moduleName, Buf, originalResult, ret );
 #endif
 	return ret;
 }
@@ -4501,6 +4956,8 @@ int __stdcall ArchiveGetFileDispatchImpl(ArchivePluginCallContext* context, LPST
 	}
 #if UNICODEHACK_PLUGIN_DEBUG
 	LogPluginPath( "GetFile", Src, Dst ? Dst : retryPath.c_str(), originalResult, ret, context->moduleName );
+	if( ret != SPI_ALL_RIGHT )
+		LogFailureEvent( "GetFile", context->moduleName, Src, originalResult, ret );
 	if( Dst && (Flag & 0x100) && ret == SPI_ALL_RIGHT )
 	{
 		HLOCAL dataHandle = *reinterpret_cast<HLOCAL*>(Dst);
@@ -4645,24 +5102,6 @@ FARPROC WrapArchivePluginFunction(HMODULE hModule, const char* procName, FARPROC
 typedef int (__stdcall *GetPictureInfoAM00FPtr)(LPSTR buf, long len, unsigned int flag, LPVOID lpInfo);
 typedef int (__stdcall *GetPictureAM00FPtr)(LPSTR buf, long len, unsigned int flag, HANDLE *pHBInfo, HANDLE *pHBm, SPI_PROGRESS lpPrgressCallback, long lData);
 
-// GetPictureInfo/GetPicture have the same export names in every Susie image
-// plugin. Keep the original address with each returned wrapper instead of
-// sharing one global trampoline; otherwise loading a second image plugin would
-// make the first plugin call the wrong implementation.
-enum ImagePluginFunction
-{
-	ImagePluginIsSupported,
-	ImagePluginGetPictureInfo,
-	ImagePluginGetPicture
-};
-
-struct ImagePluginCallContext
-{
-	ImagePluginFunction function;
-	FARPROC original;
-	char moduleName[MAX_PATH];
-};
-
 int __stdcall IsSupportedDispatchImpl(ImagePluginCallContext* context, LPSTR Filename, DWORD Dw)
 {
 	auto original = reinterpret_cast<IsSupportedAM00FPtr>(context->original);
@@ -4700,7 +5139,11 @@ int __stdcall GetPictureInfoDispatchImpl(ImagePluginCallContext* context, LPSTR 
 	// temporary strings or doing fallback bookkeeping for every JPG/PNG item.
 	if( !needsAlias )
 	{
-		return original( Buf, Len, Flag, Inf );
+		const int ret = original( Buf, Len, Flag, Inf );
+#if UNICODEHACK_PLUGIN_DEBUG
+		RecordImagePluginCall(context, "GetPictureInfo", Buf, Flag, ret);
+#endif
+		return ret;
 	}
 
 	std::string retryPath;
@@ -4719,6 +5162,9 @@ int __stdcall GetPictureInfoDispatchImpl(ImagePluginCallContext* context, LPSTR 
 		originalResult = original( Buf, Len, Flag, Inf );
 		if( originalResult == SPI_ALL_RIGHT ) ret = originalResult;
 	}
+#if UNICODEHACK_PLUGIN_DEBUG
+	RecordImagePluginCall(context, "GetPictureInfo", Buf, Flag, ret);
+#endif
 	return ret;
 }
 
@@ -4732,7 +5178,11 @@ int __stdcall GetPictureDispatchImpl(ImagePluginCallContext* context, LPSTR Buf,
 	// Unicode fallback is only needed when the ANSI path is actually damaged.
 	if( !needsAlias )
 	{
-		return original( Buf, Len, Flag, pHBInfo, pHBm, PrgressCallback, Data );
+		const int ret = original( Buf, Len, Flag, pHBInfo, pHBm, PrgressCallback, Data );
+#if UNICODEHACK_PLUGIN_DEBUG
+		RecordImagePluginCall(context, "GetPicture", Buf, Flag, ret);
+#endif
+		return ret;
 	}
 
 	std::string retryPath;
@@ -4752,6 +5202,9 @@ int __stdcall GetPictureDispatchImpl(ImagePluginCallContext* context, LPSTR Buf,
 		originalResult = original( Buf, Len, Flag, pHBInfo, pHBm, PrgressCallback, Data );
 		if( originalResult == SPI_ALL_RIGHT ) ret = originalResult;
 	}
+#if UNICODEHACK_PLUGIN_DEBUG
+	RecordImagePluginCall(context, "GetPicture", Buf, Flag, ret);
+#endif
 	return ret;
 }
 
@@ -4813,8 +5266,19 @@ __declspec(naked) int __stdcall GetPictureInfoDispatch()
 		jae image_info_alias
 		jmp image_info_scan
 	image_info_direct:
+	#if UNICODEHACK_PLUGIN_DEBUG
+		mov edx, esp
+		push dword ptr [edx+16]
+		push dword ptr [edx+12]
+		push dword ptr [edx+8]
+		push dword ptr [edx+4]
+		push eax
+		call GetPictureInfoDispatchImpl
+		ret 16
+	#else
 		mov edx, [eax+4]
 		jmp edx
+	#endif
 	image_info_alias:
 		mov edx, esp
 		push dword ptr [edx+16]
@@ -4848,8 +5312,22 @@ __declspec(naked) int __stdcall GetPictureDispatch()
 		jae image_picture_alias
 		jmp image_picture_scan
 	image_picture_direct:
+	#if UNICODEHACK_PLUGIN_DEBUG
+		mov edx, esp
+		push dword ptr [edx+28]
+		push dword ptr [edx+24]
+		push dword ptr [edx+20]
+		push dword ptr [edx+16]
+		push dword ptr [edx+12]
+		push dword ptr [edx+8]
+		push dword ptr [edx+4]
+		push eax
+		call GetPictureDispatchImpl
+		ret 28
+	#else
 		mov edx, [eax+4]
 		jmp edx
+	#endif
 	image_picture_alias:
 		mov edx, esp
 		push dword ptr [edx+28]
@@ -5004,17 +5482,18 @@ FARPROC WrapImagePluginFunction( HMODULE hModule, const char* procName, FARPROC 
 	return thunk ? reinterpret_cast<FARPROC>(thunk) : original;
 }
 
-FARPROC WINAPI GetProcAddressHook(    _In_ HMODULE hModule,    _In_ LPCSTR lpProcName 	)
-{
+	FARPROC WINAPI GetProcAddressHook(    _In_ HMODULE hModule,    _In_ LPCSTR lpProcName 	)
+	{
 		auto ret = originalGetProcAddress( hModule, lpProcName );
 		char moduleName[MAX_PATH] = {};
 		if( hModule ) GetModuleFileNameA( hModule, moduleName, sizeof(moduleName) );
-		const bool isImageProc = lpProcName && (strcmp(lpProcName, "IsSupported") == 0
+		const bool procNameIsString = lpProcName && !IS_INTRESOURCE(lpProcName);
+		const bool isImageProc = procNameIsString && (strcmp(lpProcName, "IsSupported") == 0
 			|| strcmp(lpProcName, "GetPictureInfo") == 0
 			|| strcmp(lpProcName, "GetPicture") == 0);
 		const bool isTargetImagePlugin = isImageProc
 			&& IsTargetImagePlugin( hModule, moduleName, sizeof(moduleName) );
-		const bool isArchiveEntryProc = lpProcName && (strcmp(lpProcName, "GetArchiveInfo") == 0
+		const bool isArchiveEntryProc = procNameIsString && (strcmp(lpProcName, "GetArchiveInfo") == 0
 			|| strcmp(lpProcName, "GetFileInfo") == 0
 			|| strcmp(lpProcName, "GetFile") == 0);
 		const char* moduleFileName = strrchr(moduleName, '\\');
@@ -5025,7 +5504,7 @@ FARPROC WINAPI GetProcAddressHook(    _In_ HMODULE hModule,    _In_ LPCSTR lpPro
 			|| _stricmp(moduleFileName, "ax7z.spi") == 0
 			|| _stricmp(moduleFileName, "axpdf.spi") == 0
 			|| _stricmp(moduleFileName, "axffmpeg.spi") == 0;
-		const bool isArchiveProbe = lpProcName && strcmp(lpProcName, "IsSupported") == 0
+		const bool isArchiveProbe = procNameIsString && strcmp(lpProcName, "IsSupported") == 0
 			&& isKnownArchiveModule;
 		const bool isArchiveProc = isArchiveEntryProc || isArchiveProbe;
 		const bool isArchivePlugin = isArchiveProc && moduleExtension
@@ -5039,8 +5518,12 @@ FARPROC WINAPI GetProcAddressHook(    _In_ HMODULE hModule,    _In_ LPCSTR lpPro
 		{
 			LogPluginPath( "GetProcAddress", lpProcName, "", ret ? 1 : 0, 0, moduleName );
 		}
+		if( procNameIsString && strstr(lpProcName, "PrivateProfile") != nullptr )
+		{
+			LogPluginPath( "ProfileGetProcAddress", lpProcName, "", ret ? 1 : 0, 0, moduleName );
+		}
 #endif
-		if( !lpProcName ) return ret;
+		if( !procNameIsString ) return ret;
 		if( ret && isArchivePlugin )
 			return WrapArchivePluginFunction( hModule, lpProcName, ret, moduleName );
 		// Return a per-plugin wrapper rather than patching all plugins to one shared
@@ -5065,6 +5548,8 @@ FARPROC WINAPI GetProcAddressHook(    _In_ HMODULE hModule,    _In_ LPCSTR lpPro
 void hookGetProcAddress()
 {
 	originalGetProcAddress = nCodeHook.createHookByName("kernel32.dll", "GetProcAddress", GetProcAddressHook);
+	if( !originalGetProcAddress )
+		originalGetProcAddress = nCodeHook.createHookByName("kernelbase.dll", "GetProcAddress", GetProcAddressHook);
 }
 
 }
@@ -5088,9 +5573,10 @@ void LogAddr(FILE* f, LPCVOID addr)
 void LogAbort(const char* reason)
 {
 	FILE* f = nullptr;
-	if (fopen_s(&f, "C:\\tool\\leeyes\\leeyes261\\_abort_log.txt", "a") == 0 && f)
+	if (Utility::OpenFailureLog(&f))
 	{
-		fprintf(f, "%s stack:", reason);
+		fprintf(f, "abort reason=%s t_ms=%llu tid=%lu stack:", reason,
+			(unsigned long long)::GetTickCount64(), (unsigned long)::GetCurrentThreadId());
 		void* stack[24] = {};
 		USHORT n = CaptureStackBackTrace(0, 24, stack, nullptr);
 		for (USHORT i = 0; i < n; ++i) LogAddr(f, stack[i]);
@@ -5110,12 +5596,46 @@ void __cdecl OnAbort(int)
 	LogAbort("SIGABRT");
 }
 
+bool IsActionableExceptionCode( DWORD code )
+{
+	switch( code )
+	{
+	case EXCEPTION_ACCESS_VIOLATION:
+	case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+	case EXCEPTION_DATATYPE_MISALIGNMENT:
+	case EXCEPTION_FLT_DENORMAL_OPERAND:
+	case EXCEPTION_FLT_DIVIDE_BY_ZERO:
+	case EXCEPTION_FLT_INVALID_OPERATION:
+	case EXCEPTION_FLT_OVERFLOW:
+	case EXCEPTION_FLT_STACK_CHECK:
+	case EXCEPTION_FLT_UNDERFLOW:
+	case EXCEPTION_ILLEGAL_INSTRUCTION:
+	case EXCEPTION_IN_PAGE_ERROR:
+	case EXCEPTION_INT_DIVIDE_BY_ZERO:
+	case EXCEPTION_INT_OVERFLOW:
+	case EXCEPTION_INVALID_DISPOSITION:
+	case EXCEPTION_NONCONTINUABLE_EXCEPTION:
+	case EXCEPTION_PRIV_INSTRUCTION:
+	case EXCEPTION_STACK_OVERFLOW:
+	case 0xC0000017: // STATUS_NO_MEMORY
+	case 0xC0000374: // STATUS_HEAP_CORRUPTION
+		return true;
+	default:
+		return false;
+	}
+}
+
 LONG WINAPI VectoredHandler(PEXCEPTION_POINTERS info)
 {
+	if( !info || !info->ExceptionRecord
+		|| !IsActionableExceptionCode(info->ExceptionRecord->ExceptionCode) )
+		return EXCEPTION_CONTINUE_SEARCH;
 	FILE* f = nullptr;
-	if (fopen_s(&f, "C:\\tool\\leeyes\\leeyes261\\_abort_log.txt", "a") == 0 && f)
+	if (Utility::OpenFailureLog(&f))
 	{
-		fprintf(f, "exception code=0x%08X eip=", info->ExceptionRecord->ExceptionCode);
+		fprintf(f, "exception t_ms=%llu tid=%lu code=0x%08X eip=",
+			(unsigned long long)::GetTickCount64(), (unsigned long)::GetCurrentThreadId(),
+			info->ExceptionRecord->ExceptionCode);
 		LogAddr(f, info->ExceptionRecord->ExceptionAddress);
 		fprintf(f, " stack:");
 		void* stack[24] = {};
@@ -5143,9 +5663,11 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 		Kernel32::hookLdrLoadDll();
 		Kernel32::hookRegQueryValueExW();
 		Kernel32::hookPathConversions();
+	#if UNICODEHACK_PLUGIN_DEBUG
 		AddVectoredExceptionHandler(1, Diagnostics::VectoredHandler);
 		std::set_terminate(Diagnostics::OnTerminate);
 		signal(SIGABRT, Diagnostics::OnAbort);
+	#endif
 		setlocale(LC_ALL, "Japanese_Japan.932");
 		::CoInitialize(0);
 
@@ -5155,6 +5677,11 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 			ArchivePluginName = Profile->Get("Archive","FileName", "ax7z.spi");
 		#if UNICODEHACK_PATH_DEBUG || UNICODEHACK_PLUGIN_DEBUG
 			Utility::gDebugLogEnabled = Profile->Get("Debug", "DebugLog", UINT()) != 0;
+			Utility::gFailureLogEnabled = Profile->Get("Debug", "FailureLog", UINT()) != 0;
+		#endif
+		#if UNICODEHACK_PLUGIN_DEBUG
+			SusieAM00::gImagePluginSummaryEnabled =
+				Profile->Get("Debug", "PluginSummary", UINT()) != 0;
 		#endif
 		}
 
@@ -5185,6 +5712,7 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 		{
 			User32::hookSetWindowTextA();
 		}
+		User32::hookBackgroundActivation();
 		#if UNICODEHACK_PATH_DEBUG
 		User32::hookDiagnosticMessages();
 		#endif
@@ -5206,6 +5734,9 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 		}
 		Shell32::hookDragQueryFileW();
 		Shell32::hookDragQueryFileA();
+		#if UNICODEHACK_PLUGIN_DEBUG
+		SusieAM00::StartImagePluginDiagnostics();
+		#endif
 		break;
 	case DLL_THREAD_ATTACH:
 		setlocale(LC_ALL, "Japanese_Japan.932");
@@ -5215,6 +5746,9 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 		::CoUninitialize();
 		break;
 	case DLL_PROCESS_DETACH:
+		#if UNICODEHACK_PLUGIN_DEBUG
+		SusieAM00::StopImagePluginDiagnostics();
+		#endif
 		LeeyesInternal::RequestTraceStop();
 		#if UNICODEHACK_PATH_DEBUG
 			Kernel32::Perf::LogSummary();
