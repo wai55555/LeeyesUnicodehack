@@ -8,6 +8,8 @@
 
 extern HMODULE gInjectedModule;
 extern "C" void __cdecl LeeyesInternalInvokeFullResync(void* listView);
+extern "C" volatile LONG gLeeyesInternalLowItemNullFallbackCount;
+extern "C" volatile LONG gLeeyesInternalLowItemGuardActive;
 
 namespace LeeyesInternal
 {
@@ -21,8 +23,13 @@ struct DrainState
 	DWORD depth;
 	bool suppress;
 	bool needsResync;
+	bool currentOwnerKnown;
 	DWORD queuedChanges;
 	DWORD suppressedChanges;
+	DWORD outOfScopeChanges;
+	DWORD ownerProbeAttempts;
+	void* currentOwner;
+	HWND currentListWindow;
 	void* dirtyLists[kMaximumDirtyLists];
 	DWORD dirtyListCount;
 };
@@ -36,6 +43,16 @@ struct ListWindowSearch
 	DWORD processId;
 	HWND bestWindow;
 	int bestItemCount;
+};
+
+struct DisplayedListSearch
+{
+	DWORD processId;
+	HWND listWindow;
+	LONG_PTR windowUserData;
+	DWORD listCount;
+	DWORD visibleListCount;
+	DWORD hiddenListCount;
 };
 
 struct ListSelectionSnapshot
@@ -126,6 +143,83 @@ HWND FindFileListWindow()
 	ListWindowSearch search = { ::GetCurrentProcessId(), nullptr, -1 };
 	::EnumWindows(&FindListTopLevel, reinterpret_cast<LPARAM>(&search));
 	return search.bestWindow;
+}
+
+BOOL CALLBACK FindDisplayedListChild(HWND window, LPARAM parameter)
+{
+	DisplayedListSearch* search =
+		reinterpret_cast<DisplayedListSearch*>(parameter);
+	char className[64] = {};
+	if( !::GetClassNameA(window, className, _countof(className))
+		|| strcmp(className, "TAcvListView") != 0 ) return TRUE;
+	++search->listCount;
+	if( ::IsWindowVisible(window) ) ++search->visibleListCount;
+	else ++search->hiddenListCount;
+	if( search->listWindow == nullptr )
+	{
+		search->listWindow = window;
+		search->windowUserData = ::GetWindowLongPtrA(window, GWLP_USERDATA);
+	}
+	return TRUE;
+}
+
+BOOL CALLBACK FindDisplayedListTopLevel(HWND window, LPARAM parameter)
+{
+	DisplayedListSearch* search =
+		reinterpret_cast<DisplayedListSearch*>(parameter);
+	DWORD processId = 0;
+	::GetWindowThreadProcessId(window, &processId);
+	if( processId == search->processId && ::IsWindowVisible(window) )
+		::EnumChildWindows(window, &FindDisplayedListChild, parameter);
+	return TRUE;
+}
+
+bool FindDisplayedListWindow(HWND& window)
+{
+	DisplayedListSearch search = { ::GetCurrentProcessId(), nullptr, 0, 0, 0 };
+	::EnumWindows(&FindDisplayedListTopLevel, reinterpret_cast<LPARAM>(&search));
+	WriteDiagnostic("scope_scan lists=%lu visible=%lu hidden=%lu hwnd=%p user=%p",
+		static_cast<unsigned long>(search.listCount),
+		static_cast<unsigned long>(search.visibleListCount),
+		static_cast<unsigned long>(search.hiddenListCount),
+		search.listWindow, reinterpret_cast<void*>(search.windowUserData));
+	if( search.listCount != 1 || !search.listWindow ) return false;
+	window = search.listWindow;
+	return true;
+}
+
+bool IsReadableRange(const BYTE* address, size_t length)
+{
+	if( !address || length == 0 ) return false;
+	MEMORY_BASIC_INFORMATION information = {};
+	if( ::VirtualQuery(address, &information, sizeof(information)) == 0 ) return false;
+	if( information.State != MEM_COMMIT
+		|| (information.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY
+			| PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0 )
+		return false;
+	const BYTE* end = reinterpret_cast<const BYTE*>(information.BaseAddress)
+		+ information.RegionSize;
+	return address <= end && length <= static_cast<size_t>(end - address);
+}
+
+bool DispatchOwnerContainsListWindow(void* dispatchOwner, HWND listWindow)
+{
+	if( !dispatchOwner || !listWindow ) return false;
+	const DWORD windowValue = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(listWindow));
+	const BYTE* object = reinterpret_cast<const BYTE*>(dispatchOwner);
+	if( !IsReadableRange(object, sizeof(DWORD)) ) return false;
+	// Do not assume a private field offset.  The verified dispatch owner is a
+	// Delphi ListView object; find the live HWND value in its readable object
+	// storage and bind only on an exact runtime relationship.
+	for( size_t offset = 0; offset < 0x1000; offset += sizeof(DWORD) )
+	{
+		if( !IsReadableRange(object + offset, sizeof(DWORD)) ) return false;
+		DWORD value = 0;
+		__try { value = *reinterpret_cast<const DWORD*>(object + offset); }
+		__except( EXCEPTION_EXECUTE_HANDLER ) { return false; }
+		if( value == windowValue ) return true;
+	}
+	return false;
 }
 
 bool GetListItemText(HWND window, int index, std::string& text)
@@ -265,28 +359,58 @@ extern "C" void __cdecl LeeyesInternalBeginChangeQueueDrain(void* notifier)
 	gDrainState.queuedChanges = static_cast<DWORD>(queuedChanges);
 	gDrainState.suppress = gDrainState.queuedChanges >= gBatchThreshold;
 	if( gDrainState.suppress )
+	{
+		const bool listKnown = FindDisplayedListWindow(gDrainState.currentListWindow);
+		WriteDiagnostic("scope_owner list_known=%d hwnd=%p",
+			listKnown ? 1 : 0, gDrainState.currentListWindow);
 		WriteDiagnostic("drain_begin queued=%lu threshold=%lu",
 			static_cast<unsigned long>(gDrainState.queuedChanges),
 			static_cast<unsigned long>(gBatchThreshold));
+	}
 }
 
 extern "C" BOOL __cdecl LeeyesInternalShouldDeferFileChange(
-	void* listView, DWORD rawAction, void* returnAddress)
+	void* dispatchOwner, DWORD rawAction, DWORD path0, DWORD path1,
+	void* returnAddress)
 {
+	(void)path0;
+	(void)path1;
 	if( !gDrainState.suppress ) return FALSE;
 	// The dispatcher has a separate control-action branch (6) in the verified
 	// Leeyes 2.6.1 body. It is not a filesystem item change and must continue
 	// through Leeyes' own state machine. Unknown future actions are also safer
 	// on the original path than in a guessed batch category.
-	const DWORD action = rawAction & 0xFF;
-	if( action > 5 ) return FALSE;
-	if( !RememberDirtyList(listView) ) return FALSE;
+	if( rawAction > 5 ) return FALSE;
+	if( !gDrainState.currentOwnerKnown
+		&& gDrainState.currentListWindow
+		&& gDrainState.ownerProbeAttempts < 8 )
+	{
+		++gDrainState.ownerProbeAttempts;
+		if( DispatchOwnerContainsListWindow(dispatchOwner, gDrainState.currentListWindow) )
+		{
+			gDrainState.currentOwner = dispatchOwner;
+			gDrainState.currentOwnerKnown = true;
+			WriteDiagnostic("scope_owner_bound owner=%p hwnd=%p probe=%lu",
+				dispatchOwner, gDrainState.currentListWindow,
+				static_cast<unsigned long>(gDrainState.ownerProbeAttempts));
+		}
+	}
+	if( !gDrainState.currentOwnerKnown )
+		return FALSE;
+	if( dispatchOwner != gDrainState.currentOwner )
+	{
+		++gDrainState.outOfScopeChanges;
+		return FALSE;
+	}
+	/* Path arguments are intentionally not decoded: their storage/ABI is not
+	 * verified, and the owner-to-live-ListView relation is the safe boundary. */
+	if( !RememberDirtyList(dispatchOwner) ) return FALSE;
 	gDrainState.needsResync = true;
 	++gDrainState.suppressedChanges;
 	if( gDrainState.suppressedChanges <= 4 )
 		WriteDiagnostic("defer index=%lu action=%lu caller=%p list=%p",
 			static_cast<unsigned long>(gDrainState.suppressedChanges),
-			static_cast<unsigned long>(rawAction & 0xFF), returnAddress, listView);
+			static_cast<unsigned long>(rawAction), returnAddress, dispatchOwner);
 	return TRUE;
 }
 
@@ -299,6 +423,9 @@ extern "C" void __cdecl LeeyesInternalEndChangeQueueDrain()
 	const DWORD dirtyListCount = gDrainState.dirtyListCount;
 	const DWORD queuedChanges = gDrainState.queuedChanges;
 	const DWORD suppressedChanges = gDrainState.suppressedChanges;
+	const DWORD outOfScopeChanges = gDrainState.outOfScopeChanges;
+	const LONG lowItemNullFallbacks = gLeeyesInternalLowItemNullFallbackCount;
+	const LONG lowItemGuardActive = gLeeyesInternalLowItemGuardActive;
 	const bool needsResync = gDrainState.suppress && gDrainState.needsResync;
 	if( dirtyListCount != 0 )
 		memcpy(dirtyLists, gDrainState.dirtyLists,
@@ -321,9 +448,12 @@ extern "C" void __cdecl LeeyesInternalEndChangeQueueDrain()
 		restoredSelections = RestoreListSelection(selection);
 	}
 	if( queuedChanges >= gBatchThreshold )
-		WriteDiagnostic("drain_end queued=%lu deferred=%lu refreshed=%lu selection=%lu",
+		WriteDiagnostic("drain_end queued=%lu deferred=%lu out_of_scope=%lu low_item_guard=%ld low_item_null_fallback=%ld refreshed=%lu selection=%lu",
 			static_cast<unsigned long>(queuedChanges),
 			static_cast<unsigned long>(suppressedChanges),
+			static_cast<unsigned long>(outOfScopeChanges),
+			static_cast<long>(lowItemGuardActive),
+			static_cast<long>(lowItemNullFallbacks),
 			static_cast<unsigned long>(refreshed),
 			static_cast<unsigned long>(restoredSelections));
 }

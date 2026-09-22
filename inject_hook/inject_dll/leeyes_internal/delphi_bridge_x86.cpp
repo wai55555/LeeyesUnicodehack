@@ -21,6 +21,10 @@ extern "C" void (__cdecl *gLeeyesInternalOriginalLayoutUpdate)() = nullptr;
 extern "C" void (__cdecl *gLeeyesInternalOriginalFileChangeDispatch)() = nullptr;
 extern "C" void (__cdecl *gLeeyesInternalOriginalChangeQueueDrain)() = nullptr;
 extern "C" void (__cdecl *gLeeyesInternalFullResync)() = nullptr;
+extern "C" void* gLeeyesInternalLowItemContinuation = nullptr;
+extern "C" void* gLeeyesInternalLowItemMissingFallback = nullptr;
+extern "C" volatile LONG gLeeyesInternalLowItemNullFallbackCount = 0;
+extern "C" volatile LONG gLeeyesInternalLowItemGuardActive = 0;
 
 extern "C" __declspec(naked) void LeeyesInternalRefreshHook()
 {
@@ -113,11 +117,17 @@ extern "C" __declspec(naked) void LeeyesInternalFileChangeDispatchHook()
 	{
 		pushfd
 		pushad
-		push dword ptr [esp + 36]
+		mov ebx, dword ptr [esp + 12]
+		// After pushfd/pushad, [esp+12] points to the ESP saved by pushad.
+		// That saved ESP points to EFLAGS, so return address and stack
+		// arguments are at +4, +8, and +12 respectively.
+		push dword ptr [ebx + 4]
+		push dword ptr [ebx + 8]
+		push ecx
 		push edx
 		push eax
 		call LeeyesInternalShouldDeferFileChange
-		add esp, 12
+		add esp, 20
 		test eax, eax
 		jz pass_through
 		popad
@@ -130,10 +140,36 @@ extern "C" __declspec(naked) void LeeyesInternalFileChangeDispatchHook()
 	}
 }
 
+// The original 2.6.1 code performs the virtual lookup and immediately reads
+// the returned item's action byte.  If the item disappeared between index
+// lookup and retrieval, the existing not-found path at +0x58 is the only
+// verified path that preserves the current notification processing.
+extern "C" __declspec(naked) void LeeyesInternalLowItemLookupHook()
+{
+	__asm
+	{
+		call dword ptr [ecx + 18h]
+		test eax, eax
+		jnz have_item
+		inc dword ptr [gLeeyesInternalLowItemNullFallbackCount]
+		jmp dword ptr [gLeeyesInternalLowItemMissingFallback]
+	have_item:
+		mov al, byte ptr [eax]
+		jmp dword ptr [gLeeyesInternalLowItemContinuation]
+	}
+}
+
+extern "C" void __cdecl LeeyesInternalInstallLowItemNullGuardIfArmed();
+
 extern "C" __declspec(naked) void LeeyesInternalChangeQueueDrainHook()
 {
 	__asm
 	{
+		pushfd
+		pushad
+		call LeeyesInternalInstallLowItemNullGuardIfArmed
+		popad
+		popfd
 		pushfd
 		pushad
 		push eax
@@ -169,6 +205,11 @@ namespace
 {
 typedef void (__cdecl *HookFunction)();
 
+void* gLeeyesInternalLowItemLookupSite = nullptr;
+void* gLeeyesInternalLowItemPendingSite = nullptr;
+BYTE gLeeyesInternalLowItemOriginalBytes[5] = {};
+bool gLeeyesInternalLowItemGuardInstalled = false;
+
 HookFunction RefreshHook()
 {
 	return reinterpret_cast<HookFunction>(&LeeyesInternalRefreshHook);
@@ -203,11 +244,76 @@ HookFunction ChangeQueueDrainHook()
 {
 	return reinterpret_cast<HookFunction>(&LeeyesInternalChangeQueueDrainHook);
 }
+
+bool InstallLowItemNullGuard(void* lookupSite)
+{
+	if( !lookupSite || gLeeyesInternalLowItemGuardInstalled ) return false;
+	const BYTE expected[5] = { 0xFF, 0x51, 0x18, 0x8A, 0x00 };
+	if( memcmp(lookupSite, expected, sizeof(expected)) != 0 ) return false;
+	BYTE* site = reinterpret_cast<BYTE*>(lookupSite);
+	DWORD oldProtect = 0;
+	if( !::VirtualProtect(site, sizeof(expected), PAGE_EXECUTE_READWRITE, &oldProtect) )
+		return false;
+	gLeeyesInternalLowItemNullFallbackCount = 0;
+	memcpy(gLeeyesInternalLowItemOriginalBytes, site, sizeof(expected));
+	BYTE patch[5] = { 0xE9, 0, 0, 0, 0 };
+	const ULONG_PTR hookAddress = reinterpret_cast<ULONG_PTR>(
+		&LeeyesInternalLowItemLookupHook);
+	const ULONG_PTR siteEnd = reinterpret_cast<ULONG_PTR>(site + sizeof(patch));
+	*reinterpret_cast<LONG*>(&patch[1]) = static_cast<LONG>(hookAddress - siteEnd);
+	memcpy(site, patch, sizeof(patch));
+	::VirtualProtect(site, sizeof(expected), oldProtect, &oldProtect);
+	::FlushInstructionCache(::GetCurrentProcess(), site, sizeof(patch));
+	gLeeyesInternalLowItemLookupSite = lookupSite;
+	gLeeyesInternalLowItemContinuation = site + 5;
+	gLeeyesInternalLowItemMissingFallback = site + 0x58;
+	gLeeyesInternalLowItemGuardInstalled = true;
+	gLeeyesInternalLowItemGuardActive = 1;
+	return true;
+}
+
+void ArmLowItemNullGuard(void* lookupSite)
+{
+	if( !gLeeyesInternalLowItemGuardInstalled )
+		gLeeyesInternalLowItemPendingSite = lookupSite;
+}
+
+void RemoveLowItemNullGuard()
+{
+	if( !gLeeyesInternalLowItemGuardInstalled || !gLeeyesInternalLowItemLookupSite ) return;
+	BYTE* site = reinterpret_cast<BYTE*>(gLeeyesInternalLowItemLookupSite);
+	DWORD oldProtect = 0;
+	if( ::VirtualProtect(site, sizeof(gLeeyesInternalLowItemOriginalBytes),
+		PAGE_EXECUTE_READWRITE, &oldProtect) )
+	{
+		memcpy(site, gLeeyesInternalLowItemOriginalBytes,
+			sizeof(gLeeyesInternalLowItemOriginalBytes));
+		::VirtualProtect(site, sizeof(gLeeyesInternalLowItemOriginalBytes),
+			oldProtect, &oldProtect);
+		::FlushInstructionCache(::GetCurrentProcess(), site,
+			sizeof(gLeeyesInternalLowItemOriginalBytes));
+	}
+	gLeeyesInternalLowItemLookupSite = nullptr;
+	gLeeyesInternalLowItemPendingSite = nullptr;
+	gLeeyesInternalLowItemContinuation = nullptr;
+	gLeeyesInternalLowItemMissingFallback = nullptr;
+	gLeeyesInternalLowItemGuardInstalled = false;
+	gLeeyesInternalLowItemGuardActive = 0;
+}
+
+extern "C" void __cdecl LeeyesInternalInstallLowItemNullGuardIfArmed()
+{
+	if( gLeeyesInternalLowItemGuardInstalled || !gLeeyesInternalLowItemPendingSite ) return;
+	void* site = gLeeyesInternalLowItemPendingSite;
+	if( InstallLowItemNullGuard(site) )
+		gLeeyesInternalLowItemPendingSite = nullptr;
+}
 }
 
 bool InstallPassThroughHooks(const ResolvedTargets& targets)
 {
-	if( !targets.refresh || !targets.changing || !targets.change || !targets.changeCallsRefresh )
+	if( !targets.refresh || !targets.changing || !targets.change
+		|| !targets.changeCallsRefresh )
 		return false;
 	gLeeyesInternalOriginalRefresh = reinterpret_cast<HookFunction>(LeeyesInternalCreateHook(
 		targets.refresh, reinterpret_cast<void*>(RefreshHook())));
@@ -255,14 +361,17 @@ void RemovePassThroughHooks()
 
 bool InstallFileMoveBatchHooks(const ResolvedTargets& targets)
 {
-	if( !targets.fileChangeDispatch || !targets.changeQueueDrain || !targets.fullResync ) return false;
+	if( !targets.lowItemLookup || !targets.fileChangeDispatch
+		|| !targets.changeQueueDrain || !targets.fullResync ) return false;
 	gLeeyesInternalFullResync = reinterpret_cast<HookFunction>(targets.fullResync);
+	ArmLowItemNullGuard(targets.lowItemLookup);
 	gLeeyesInternalOriginalFileChangeDispatch = reinterpret_cast<HookFunction>(
 		LeeyesInternalCreateHook(targets.fileChangeDispatch,
 			reinterpret_cast<void*>(FileChangeDispatchHook())));
 	if( !gLeeyesInternalOriginalFileChangeDispatch )
 	{
 		gLeeyesInternalFullResync = nullptr;
+		gLeeyesInternalLowItemPendingSite = nullptr;
 		return false;
 	}
 	gLeeyesInternalOriginalChangeQueueDrain = reinterpret_cast<HookFunction>(
@@ -273,6 +382,7 @@ bool InstallFileMoveBatchHooks(const ResolvedTargets& targets)
 		LeeyesInternalRemoveHook(reinterpret_cast<void*>(FileChangeDispatchHook()));
 		gLeeyesInternalOriginalFileChangeDispatch = nullptr;
 		gLeeyesInternalFullResync = nullptr;
+		gLeeyesInternalLowItemPendingSite = nullptr;
 		return false;
 	}
 	return true;
@@ -287,6 +397,8 @@ void RemoveFileMoveBatchHooks()
 	gLeeyesInternalOriginalChangeQueueDrain = nullptr;
 	gLeeyesInternalOriginalFileChangeDispatch = nullptr;
 	gLeeyesInternalFullResync = nullptr;
+	RemoveLowItemNullGuard();
+	gLeeyesInternalLowItemPendingSite = nullptr;
 }
 
 }

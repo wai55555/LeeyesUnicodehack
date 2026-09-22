@@ -53,7 +53,12 @@ const BYTE kChangeQueueDrainSignature[] =
 	  0x53, 0x56, 0x57, 0x89, 0x45, 0xFC, 0x33, 0xC0, 0x55, 0x68,
 	  0x00, 0x00, 0x00, 0x00, 0x64, 0xFF, 0x30, 0x64, 0x89, 0x20,
 	  0x8B, 0x45, 0xFC, 0x8B, 0x40, 0x10, 0x33, 0xD2 };
-
+// Verified 2.6.1 sequence at the low-level rename-pair lookup.  The
+// original code dereferences the virtual lookup result immediately even when
+// the queue index is valid but the item has already disappeared.
+const BYTE kLowItemLookupSignature[] =
+	{ 0xFF, 0x51, 0x18, 0x8A, 0x00, 0x2C, 0x02, 0x74,
+	  0x04, 0x2C, 0x03, 0x75, 0x40 };
 const TargetSpec kSpecs[] =
 {
 	{ TargetKind::Refresh, kRefreshSignature, "xxxxxxxxxxxxxx", sizeof(kRefreshSignature) },
@@ -68,7 +73,9 @@ const TargetSpec kSpecs[] =
 	{ TargetKind::FullResync, kFullResyncSignature,
 	  "xxxxxxxxxxxxxxxxxx????xxxx????xxx", sizeof(kFullResyncSignature) },
 	{ TargetKind::ChangeQueueDrain, kChangeQueueDrainSignature,
-	  "xxxxxxxxxxxxxxxxxxx????xxxxxxxxxxxxxx", sizeof(kChangeQueueDrainSignature) }
+	  "xxxxxxxxxxxxxxxxxxx????xxxxxxxxxxxxxx", sizeof(kChangeQueueDrainSignature) },
+	{ TargetKind::LowItemLookup, kLowItemLookupSignature,
+	  "xxxxxxxxxxxxx", sizeof(kLowItemLookupSignature) }
 };
 
 bool IsExecutableRange(const BYTE* address, size_t length)
@@ -88,6 +95,24 @@ bool Matches(const BYTE* address, const TargetSpec& spec)
 	for( size_t index = 0; index < spec.signatureLength; ++index )
 		if( spec.mask[index] == 'x' && address[index] != spec.signature[index] ) return false;
 	return true;
+}
+
+bool ValidateLowItemLookup(const BYTE* image, const IMAGE_SECTION_HEADER& section,
+	const BYTE* address)
+{
+	if( !image || !address || !section.Misc.VirtualSize ) return false;
+	const BYTE* begin = image + section.VirtualAddress;
+	const BYTE* end = begin + section.Misc.VirtualSize;
+	if( address < begin || address >= end ) return false;
+	const BYTE continuation[] =
+		{ 0x2C, 0x02, 0x74, 0x04, 0x2C, 0x03, 0x75, 0x40 };
+	const BYTE missingItemPath[] =
+		{ 0x8B, 0x55, 0xFC, 0x8B, 0x46, 0x0C, 0x8B, 0x08,
+		  0xFF, 0x51, 0x18, 0x83, 0xC0, 0x04 };
+	return IsExecutableRange(address + 5, sizeof(continuation))
+		&& IsExecutableRange(address + 0x58, sizeof(missingItemPath))
+		&& memcmp(address + 5, continuation, sizeof(continuation)) == 0
+		&& memcmp(address + 0x58, missingItemPath, sizeof(missingItemPath)) == 0;
 }
 
 const IMAGE_SECTION_HEADER* FindTextSection(const BYTE* image, const IMAGE_NT_HEADERS32* nt)
@@ -148,7 +173,8 @@ bool IsRequired(TargetKind kind, bool requireTraceTargets, bool requireBatchTarg
 	if( requireTraceTargets && (kind == TargetKind::Refresh
 		|| kind == TargetKind::Changing || kind == TargetKind::Change) ) return true;
 	if( requireBatchTargets && (kind == TargetKind::FileChangeDispatch
-		|| kind == TargetKind::FullResync || kind == TargetKind::ChangeQueueDrain) ) return true;
+		|| kind == TargetKind::FullResync || kind == TargetKind::ChangeQueueDrain
+		|| kind == TargetKind::LowItemLookup) ) return true;
 	return false;
 }
 
@@ -180,6 +206,7 @@ void AssignTarget(ResolvedTargets& targets, TargetKind kind, void* address)
 	case TargetKind::FileChangeDispatch: targets.fileChangeDispatch = address; break;
 	case TargetKind::FullResync: targets.fullResync = address; break;
 	case TargetKind::ChangeQueueDrain: targets.changeQueueDrain = address; break;
+	case TargetKind::LowItemLookup: targets.lowItemLookup = address; break;
 	}
 }
 
@@ -199,6 +226,7 @@ const char* TargetKindName(TargetKind kind)
 	case TargetKind::FileChangeDispatch: return "file_change_dispatch";
 	case TargetKind::FullResync: return "full_resync";
 	case TargetKind::ChangeQueueDrain: return "change_queue_drain";
+	case TargetKind::LowItemLookup: return "low_item_lookup";
 	}
 	return "unknown";
 }
@@ -256,6 +284,14 @@ bool ResolveTargets(ResolvedTargets& targets, bool requireTraceTargets,
 			return false;
 		}
 		AssignTarget(targets, spec.kind, address);
+	}
+
+	if( requireBatchTargets
+		&& !ValidateLowItemLookup(image, *text,
+			reinterpret_cast<const BYTE*>(targets.lowItemLookup)) )
+	{
+		SetFailure(targets, "low item lookup structure mismatch");
+		return false;
 	}
 
 	if( !requireTraceTargets ) return true;

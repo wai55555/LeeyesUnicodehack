@@ -5667,6 +5667,29 @@ LONG WINAPI VectoredHandler(PEXCEPTION_POINTERS info)
 			(unsigned long long)::GetTickCount64(), (unsigned long)::GetCurrentThreadId(),
 			info->ExceptionRecord->ExceptionCode);
 		LogAddr(f, info->ExceptionRecord->ExceptionAddress);
+		if( info->ContextRecord )
+		{
+			const CONTEXT* context = info->ContextRecord;
+			fprintf(f, " regs=eax:0x%08lX ebx:0x%08lX ecx:0x%08lX edx:0x%08lX"
+				" esi:0x%08lX edi:0x%08lX ebp:0x%08lX esp:0x%08lX"
+				" eflags:0x%08lX",
+				static_cast<unsigned long>(context->Eax),
+				static_cast<unsigned long>(context->Ebx),
+				static_cast<unsigned long>(context->Ecx),
+				static_cast<unsigned long>(context->Edx),
+				static_cast<unsigned long>(context->Esi),
+				static_cast<unsigned long>(context->Edi),
+				static_cast<unsigned long>(context->Ebp),
+				static_cast<unsigned long>(context->Esp),
+				static_cast<unsigned long>(context->EFlags));
+		}
+		if( info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION
+			&& info->ExceptionRecord->NumberParameters >= 2 )
+			fprintf(f, " av_operation=%llu av_address=0x%p",
+				static_cast<unsigned long long>(
+					info->ExceptionRecord->ExceptionInformation[0]),
+				reinterpret_cast<void*>(static_cast<ULONG_PTR>(
+					info->ExceptionRecord->ExceptionInformation[1])));
 		fprintf(f, " stack:");
 		void* stack[24] = {};
 		USHORT n = CaptureStackBackTrace(0, 24, stack, nullptr);
