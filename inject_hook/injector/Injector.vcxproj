@@ -57,7 +57,7 @@
     <ClCompile>
       <Optimization>Disabled</Optimization>
       <!-- The exhaustive sweep is enabled only in the diagnostic launcher. -->
-      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;UNICODEHACK_SWEEP_DIAGNOSTICS=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;UNICODEHACK_SWEEP_DIAGNOSTICS=1;UNICODEHACK_STARTUP_DIAGNOSTICS=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <MinimalRebuild>true</MinimalRebuild>
       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
@@ -81,7 +81,7 @@
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <!-- Release LeeyesW remains the normal launcher; reject diagnostic sweep mode. -->
-      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;UNICODEHACK_SWEEP_DIAGNOSTICS=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;UNICODEHACK_SWEEP_DIAGNOSTICS=0;UNICODEHACK_STARTUP_DIAGNOSTICS=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <PrecompiledHeader />
@@ -113,6 +113,14 @@
     <ClCompile Include="..\NInjectLib\RemoteLibCall.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\common\directory_snapshot.h" />
+    <ClInclude Include="..\common\state_snapshot_wire.h" />
+    <ClInclude Include="..\common\state_snapshot_child.h" />
+    <ClInclude Include="..\common\state_snapshot_process.h" />
+    <ClInclude Include="..\common\state_sync_scheduler.h" />
+    <ClInclude Include="..\common\state_sync_coordinator.h" />
+    <ClInclude Include="..\common\state_sync_worker.h" />
+    <ClInclude Include="..\common\notification_scope.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="stdafx.h" />
     <ClInclude Include="targetver.h" />

@@ -7,6 +7,7 @@
 #endif
 
 #include "stdafx.h"
+#include "../common/path_extension.h"
 #include <../NCodeHook/NCodeHookInstantiation.h>
 #ifdef NDEBUG
 #pragma comment(lib,"../NCodeHook/distorm.lib")
@@ -43,6 +44,99 @@ __declspec(dllexport) void dummyExport() {}
 // are deleted when the destructor of nCodeHook is called!
 NCodeHookIA32 nCodeHook;
 HMODULE gInjectedModule = nullptr;
+
+#if UNICODEHACK_PATH_DEBUG
+// Optional diagnostic filter; leave unset to avoid logging arbitrary paths.
+bool DebugPathMatches(const wchar_t* path)
+{
+ if (!path) return false;
+ wchar_t filter[512] = {};
+ DWORD length = GetEnvironmentVariableW(L"UNICODEHACK_DEBUG_PATH_FILTER", filter, _countof(filter));
+ return length > 0 && length < _countof(filter) && wcsstr(path, filter) != nullptr;
+}
+bool DebugPathMatches(const char* path)
+{
+ if (!path) return false;
+ int length = MultiByteToWideChar(CP_ACP, 0, path, -1, nullptr, 0);
+ if (length <= 0) return false;
+ std::vector<wchar_t> wide(length);
+ return MultiByteToWideChar(CP_ACP, 0, path, -1, wide.data(), length) && DebugPathMatches(wide.data());
+}
+#endif
+
+
+
+#if UNICODEHACK_PATH_DEBUG
+namespace EnumerationDiagnostic
+{
+std::atomic<unsigned long long> collisionNext(0);
+std::atomic<unsigned long long> pathResolutionNext(0);
+std::atomic<unsigned long long> ansiEnumerationNext(0);
+std::atomic<unsigned long long> treeNext(0);
+std::atomic<unsigned long long> treeGetItem(0);
+std::atomic<unsigned long long> treeOther(0);
+std::atomic<unsigned long long> treeInsert(0);
+std::atomic<unsigned long long> treeDelete(0);
+std::atomic<unsigned long long> treeSetItem(0);
+bool lightweightTreeTiming = false;
+}
+#endif
+
+#ifndef UNICODEHACK_STARTUP_DIAGNOSTICS
+#define UNICODEHACK_STARTUP_DIAGNOSTICS 0
+#endif
+
+#if UNICODEHACK_STARTUP_DIAGNOSTICS
+namespace
+{
+volatile LONG gStartupDiagnosticEnabled = 0;
+volatile LONG gStartupDiagnosticWriting = 0;
+volatile LONG gStartupDiagnosticExceptionCount = 0;
+volatile LONG gStartupDiagnosticExceptionHandling = 0;
+}
+#endif
+
+extern "C" void StartupDiagnosticLog(const char* stage, const char* detail)
+{
+#if UNICODEHACK_STARTUP_DIAGNOSTICS
+	if( !stage || !gInjectedModule
+		|| ::InterlockedCompareExchange(&gStartupDiagnosticEnabled, 0, 0) == 0
+		|| ::InterlockedCompareExchange(&gStartupDiagnosticWriting, 1, 0) != 0 ) return;
+	wchar_t path[MAX_PATH] = {};
+	DWORD length = ::GetModuleFileNameW(gInjectedModule, path, _countof(path));
+	if( length > 0 && length < _countof(path) )
+	{
+		wchar_t* slash = wcsrchr(path, L'\\');
+		static const wchar_t name[] = L"Leeyes_startup_diagnostic.txt";
+		if( slash && static_cast<size_t>(slash + 1 - path) + _countof(name) <= _countof(path) )
+		{
+			wcscpy_s(slash + 1, _countof(path) - static_cast<size_t>(slash + 1 - path), name);
+			HANDLE file = ::CreateFileW(path, FILE_APPEND_DATA,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+			if( file != INVALID_HANDLE_VALUE )
+			{
+				char line[1024] = {};
+				int count = sprintf_s(line, "tick_ms=%llu pid=%lu tid=%lu source=dll stage=%s %s\r\n",
+					static_cast<unsigned long long>(::GetTickCount64()),
+					static_cast<unsigned long>(::GetCurrentProcessId()),
+					static_cast<unsigned long>(::GetCurrentThreadId()), stage,
+					detail ? detail : "");
+				if( count > 0 )
+				{
+					DWORD written = 0;
+					::WriteFile(file, line, static_cast<DWORD>(count), &written, nullptr);
+				}
+				::CloseHandle(file);
+			}
+		}
+	}
+	::InterlockedExchange(&gStartupDiagnosticWriting, 0);
+#else
+	(void)stage;
+	(void)detail;
+#endif
+}
 
 #if UNICODEHACK_PLUGIN_DEBUG
 namespace SusieAM00
@@ -322,7 +416,8 @@ bool IsBestFitConversion( const std::wstring& wide, const std::string& ansi )
 	// the \"\\?\\\" prefix internal so it never leaks into the UI or plugins.
 	std::wstring ToExtendedPath( const std::wstring& path )
 	{
-		if( path.empty() || path.compare(0, 4, L"\\\\?\\") == 0 ) return path;
+		if( path.empty() || path.compare(0, 4, L"\\\\?\\") == 0
+			|| path.compare(0, 4, L"\\??\\") == 0 || path.compare(0, 4, L"\\\\.\\") == 0 ) return path;
 		if( path.size() < 248 ) return path;
 		if( path.compare(0, 2, L"\\\\") == 0 )
 			return L"\\\\?\\UNC\\" + path.substr(2);
@@ -378,7 +473,8 @@ bool IsBestFitConversion( const std::wstring& wide, const std::string& ansi )
 			if( length == 0 || length >= buffer.size() ) return std::wstring();
 		}
 		std::wstring result(buffer.data(), length);
-		if( result.compare(0, 4, L"\\\\?\\") == 0 ) result.erase(0, 4);
+		if( result.compare(0, 8, L"\\\\?\\UNC\\") == 0 ) result = L"\\\\" + result.substr(8);
+		else if( result.compare(0, 4, L"\\\\?\\") == 0 ) result.erase(0, 4);
 		return result;
 	}
 
@@ -410,9 +506,9 @@ std::wstring GetWidePath( std::string Path )
 	// against the real directory entries before the legacy wildcard fallback
 	// can return only a parent directory or the first unrelated match.
 	std::wstring collisionPath;
-	if( Path.find('?') != std::string::npos && Path.find('*') == std::string::npos
-		&& ResolveAnsiPathCollision(Path, collisionPath) )
+	if( Path.find('?') != std::string::npos && Path.find('*') == std::string::npos )
 	{
+		if( !ResolveAnsiPathCollision(Path, collisionPath) ) return std::wstring();
 		std::lock_guard<std::mutex> lock(gWidePathCacheMutex);
 		gWidePathCache[Path] = collisionPath;
 		return collisionPath;
@@ -481,7 +577,11 @@ std::wstring GetWidePath( std::string Path )
 								settled_path .push_back(L'\\' );
 								break;
 							}
-						}	while( ::FindNextFileW( hFind, &FindData ) );
+						}	while(
+							#if UNICODEHACK_PATH_DEBUG
+							(++EnumerationDiagnostic::pathResolutionNext, true) &&
+							#endif
+							::FindNextFileW( hFind, &FindData ) );
 						::FindClose( hFind );
 					}
 				}
@@ -655,15 +755,17 @@ std::string GetOrCreateAsciiAlias( const std::wstring& Path, const std::string& 
 	auto dotPos = nameOnly.find_last_of( L'.' );
 	if( !isDirectory && dotPos != std::wstring::npos ) ext = nameOnly.substr( dotPos );
 
-	wchar_t aliasName[64] = {};
-	swprintf_s( aliasName, L"~u%016llx%s", FnvHash( Path ), ext.c_str() );
+	wchar_t aliasHash[32] = {};
+	swprintf_s( aliasHash, L"~u%016llx", FnvHash( Path ) );
+	const std::wstring aliasName = std::wstring(aliasHash) + ext;
+	if( aliasName.size() >= MAX_PATH ) return std::string();
 	std::wstring aliasPath = parentDir + L"\\" + aliasName;
 
 	// Convert the short synthetic leaf by itself. Converting the complete real
 	// path through a MAX_PATH-sized buffer fails precisely for the long names
 	// this fallback is meant to repair.
 	char aliasLeaf[MAX_PATH] = {};
-	if( !WideCharToMultiByte( 932, 0, aliasName, -1, aliasLeaf, MAX_PATH, 0, 0 ) )
+	if( !WideCharToMultiByte( 932, 0, aliasName.c_str(), -1, aliasLeaf, MAX_PATH, 0, 0 ) )
 		return std::string();
 	std::string leafAnsi = aliasLeaf;
 	std::string aliasAnsi;
@@ -707,7 +809,7 @@ bool HasAnsiPathLengthIssue( LPCSTR path )
 
 bool NeedsAnsiPathAlias( LPCSTR path )
 {
-	return path && (strchr(path, '?') != nullptr || HasAnsiPathLengthIssue(path));
+	return path && (strchr(path, '?') != nullptr || HasAnsiPathLengthIssue(path) || HasSyntheticAlias(path));
 }
 
 // CP932 conversion is lossy: different Unicode characters can produce the same
@@ -781,7 +883,11 @@ bool ResolveAnsiPathCollision( const std::string& ansiPath, std::wstring& resolv
 				std::string encoded;
 				if( WideToCP932BestFit(data.cFileName, encoded) && encoded == wanted )
 				{ match = data.cFileName; if( ++matches > 1 ) break; }
-			} while( ::FindNextFileW(h, &data) );
+			} while(
+				#if UNICODEHACK_PATH_DEBUG
+				(++EnumerationDiagnostic::collisionNext, true) &&
+				#endif
+				::FindNextFileW(h, &data) );
 			::FindClose(h);
 			if( matches != 1 ) return false;
 			current += match;
@@ -924,21 +1030,23 @@ std::string GetFullyAsciiAlias( const std::wstring& path )
 	// Resolve the folder alias first; asking for an 8.3 name for every individual
 	// image is much slower and provides no additional benefit in that case.
 	auto shortPath = GetShortPathWLong( path );
-	if( !shortPath.empty() && WideToCP932(shortPath, direct) )
+	if( !shortPath.empty() && (isDirectory || SamePathExtension(path, shortPath)) && WideToCP932(shortPath, direct) )
 		return direct;
 
 	std::wstring rootWide;
 	std::string rootAnsi;
 	if( !GetAliasRoot( rootWide, rootAnsi ) ) return std::string();
 
-	wchar_t aliasName[64] = {};
+	wchar_t aliasHash[32] = {};
 	std::wstring extension;
 	auto dotPos = leaf.find_last_of( L'.' );
 	if( !isDirectory && dotPos != std::wstring::npos ) extension = leaf.substr(dotPos);
 	std::string extensionAnsi;
 	WideToCP932( extension, extensionAnsi );
 	std::wstring aliasExtension = extensionAnsi.empty() ? L"" : extension;
-	swprintf_s( aliasName, L"~u%016llx%s", FnvHash(path), aliasExtension.c_str() );
+	swprintf_s( aliasHash, L"~u%016llx", FnvHash(path) );
+	const std::wstring aliasName = std::wstring(aliasHash) + aliasExtension;
+	if( aliasName.size() >= MAX_PATH ) return std::string();
 	std::wstring aliasPath = rootWide + L"\\" + aliasName;
 	std::string aliasAnsi = rootAnsi + "\\" + std::string("~u") +
 		[] (uint64_t value) {
@@ -1163,7 +1271,7 @@ namespace Perf
 		ULONG_PTR offset = module ? reinterpret_cast<ULONG_PTR>(caller)
 			- reinterpret_cast<ULONG_PTR>(module) : 0;
 		char itemText[160] = {};
-		if( item->pszText )
+		if( item->pszText && item->pszText != LPSTR_TEXTCALLBACKA )
 		{
 			__try
 			{
@@ -1338,7 +1446,13 @@ namespace Perf
 	void LogSummary()
 	{
 		FILE* log = nullptr;
-		if( !Utility::OpenDebugLog(&log) ) return;
+		if( !Utility::OpenFailureLog(&log) ) return;
+		fprintf(log, "enumeration_summary pid=%lu tick=%llu find_next_w=%llu collision_next=%llu path_resolution_next=%llu ansi_wide_next=%llu remainder=%llu\n",
+			(unsigned long)::GetCurrentProcessId(), (unsigned long long)::GetTickCount64(),
+			findNextWCalls.load(), EnumerationDiagnostic::collisionNext.load(),
+			EnumerationDiagnostic::pathResolutionNext.load(), EnumerationDiagnostic::ansiEnumerationNext.load(),
+			findNextWCalls.load() >= EnumerationDiagnostic::collisionNext.load() + EnumerationDiagnostic::pathResolutionNext.load() + EnumerationDiagnostic::ansiEnumerationNext.load()
+			? findNextWCalls.load() - EnumerationDiagnostic::collisionNext.load() - EnumerationDiagnostic::pathResolutionNext.load() - EnumerationDiagnostic::ansiEnumerationNext.load() : 0ULL);
 		fprintf(log,
 			"perf api find_first=%llu find_first_success=%llu find_first_test_masks=%llu "
 			"find_next=%llu find_next_success=%llu find_close=%llu "
@@ -1386,6 +1500,83 @@ namespace Perf
 	}
 }
 #endif
+
+#if UNICODEHACK_PATH_DEBUG
+extern "C" void __cdecl LeeyesTreeTimingRead(unsigned long long*, unsigned long long*, unsigned long long*);
+extern "C" void __cdecl LeeyesTreeReadActions(unsigned long long*);
+extern "C" unsigned long long __cdecl LeeyesTreeDataAssignmentCount();
+extern "C" unsigned long long __cdecl LeeyesTreeExperimentCount();
+extern "C" void __cdecl LeeyesTreeReadSearch(unsigned long long*, unsigned long long*);
+extern "C" void __cdecl LeeyesTreeReadShadow(unsigned long long*, unsigned long long*, unsigned long long*, unsigned long long*, unsigned long long*, unsigned long long*, unsigned long long*, unsigned long long*, unsigned long long*);
+extern "C" unsigned long long __cdecl LeeyesTreeMutationGeneration()
+{
+	return EnumerationDiagnostic::treeInsert.load(std::memory_order_relaxed)
+		+ EnumerationDiagnostic::treeDelete.load(std::memory_order_relaxed)
+		+ EnumerationDiagnostic::treeSetItem.load(std::memory_order_relaxed);
+}
+namespace
+{
+thread_local HWND gDiagnosticTreeWindow = nullptr;
+struct TreeCountProbe { DWORD processId; unsigned long trees; unsigned long nodes; HWND window; };
+BOOL CALLBACK CountTreeChild(HWND window, LPARAM value)
+{
+	TreeCountProbe* probe = reinterpret_cast<TreeCountProbe*>(value);
+	char name[64] = {};
+	if( ::GetClassNameA(window, name, _countof(name)) > 0
+		&& strcmp(name, "TAcvTreeView") == 0 && ::IsWindowVisible(window) )
+	{
+		++probe->trees;
+		probe->window = window;
+		probe->nodes += static_cast<unsigned long>(::SendMessageA(window, TVM_GETCOUNT, 0, 0));
+	}
+	return TRUE;
+}
+BOOL CALLBACK CountTreeTop(HWND window, LPARAM value)
+{
+	TreeCountProbe* probe = reinterpret_cast<TreeCountProbe*>(value);
+	DWORD processId = 0;
+	::GetWindowThreadProcessId(window, &processId);
+	if( processId == probe->processId && ::IsWindowVisible(window) )
+		::EnumChildWindows(window, CountTreeChild, value);
+	return TRUE;
+}
+}
+extern "C" HWND __cdecl LeeyesTreeDiagnosticWindow() { return gDiagnosticTreeWindow; }
+#endif
+extern "C" void __cdecl LeeyesEnumerationDiagnosticSnapshot(const char* stage, DWORD queued)
+{
+#if UNICODEHACK_PATH_DEBUG
+	FILE* log = nullptr;
+	if( !Utility::OpenFailureLog(&log) ) return;
+	unsigned long long treeCalls = 0, treeTicks = 0, treeFrequency = 0;
+	LeeyesTreeTimingRead(&treeCalls, &treeTicks, &treeFrequency);
+	unsigned long long actions[7] = {};
+	LeeyesTreeReadActions(actions);
+	unsigned long long searchCalls = 0, searchHits = 0;
+	LeeyesTreeReadSearch(&searchCalls, &searchHits);
+	unsigned long long shadowCandidates = 0, shadowContradictions = 0, shadowInvalidations = 0;
+	unsigned long long shadowPositiveCandidates = 0, shadowStateChanges = 0, shadowStateUnreadable = 0;
+	unsigned long long shadowHandleVerified = 0, shadowHandleFailed = 0, nodeDestructions = 0;
+	LeeyesTreeReadShadow(&shadowCandidates, &shadowContradictions, &shadowInvalidations, &shadowPositiveCandidates, &shadowStateChanges, &shadowStateUnreadable, &shadowHandleVerified, &shadowHandleFailed, &nodeDestructions);
+	TreeCountProbe probe = { ::GetCurrentProcessId(), 0, 0, nullptr };
+	if( EnumerationDiagnostic::lightweightTreeTiming )
+		::EnumWindows(CountTreeTop, reinterpret_cast<LPARAM>(&probe));
+	gDiagnosticTreeWindow = probe.trees == 1 ? probe.window : nullptr;
+	fprintf(log, "enumeration_snapshot stage=%s pid=%lu tick=%llu queued=%lu total=%llu collision=%llu path_resolution=%llu ansi_wide=%llu tree_next=%llu tree_getitem=%llu tree_other=%llu tree_insert=%llu tree_delete=%llu tree_setitem=%llu tree_calls=%llu tree_ticks=%llu tree_frequency=%llu visible_trees=%lu tree_nodes=%lu actions=%llu,%llu,%llu,%llu,%llu,%llu,%llu search_calls=%llu search_hits=%llu shadow_candidates=%llu shadow_contradictions=%llu shadow_invalidations=%llu shadow_positive_candidates=%llu shadow_state_changes=%llu shadow_state_unreadable=%llu shadow_handle_verified=%llu shadow_handle_failed=%llu node_destructions=%llu node_data_assignments=%llu experiment_applied=%llu\n",
+		stage, (unsigned long)::GetCurrentProcessId(), (unsigned long long)::GetTickCount64(), (unsigned long)queued,
+		Kernel32::Perf::findNextWCalls.load(), EnumerationDiagnostic::collisionNext.load(),
+		EnumerationDiagnostic::pathResolutionNext.load(), EnumerationDiagnostic::ansiEnumerationNext.load(),
+		EnumerationDiagnostic::treeNext.load(), EnumerationDiagnostic::treeGetItem.load(),
+		EnumerationDiagnostic::treeOther.load(), EnumerationDiagnostic::treeInsert.load(),
+		EnumerationDiagnostic::treeDelete.load(), EnumerationDiagnostic::treeSetItem.load(), treeCalls, treeTicks, treeFrequency, probe.trees, probe.nodes,
+		actions[0], actions[1], actions[2], actions[3], actions[4], actions[5], actions[6], searchCalls, searchHits,
+		shadowCandidates, shadowContradictions, shadowInvalidations, shadowPositiveCandidates, shadowStateChanges, shadowStateUnreadable, shadowHandleVerified, shadowHandleFailed, nodeDestructions, LeeyesTreeDataAssignmentCount(), LeeyesTreeExperimentCount());
+	fclose(log);
+#else
+	(void)stage;
+	(void)queued;
+#endif
+}
 
 	typedef int (WINAPI *WideCharToMultiByteFPtr)(UINT, DWORD, LPCWCH, int, LPSTR, int, LPCCH, LPBOOL);
 	WideCharToMultiByteFPtr originalWideCharToMultiByte = nullptr;
@@ -1535,7 +1726,7 @@ bool IsEnumerationPattern( LPCSTR pattern )
 #if UNICODEHACK_PATH_DEBUG
 void LogFindResult( const char* api, LPCSTR pattern, LPCSTR name )
 {
-	if( !name || !strstr(name, "neekosan") ) return;
+	if( !DebugPathMatches(name) ) return;
 	FILE* lf = nullptr;
 	if( !Utility::OpenDebugLog(&lf) ) return;
 	fprintf(lf, "%s pattern=[%s] name=[%s] bytes=", api,
@@ -1637,7 +1828,8 @@ bool CopyFindDataWToA( const WIN32_FIND_DATAW& source, const std::wstring& paren
 		|| HasPathLengthIssue(parentDirAnsi, fileName);
 	if( needsAlias && !parentDirWide.empty() )
 	{
-		if( alternateName[0] && !strchr(fileName, '?') )
+		if( alternateName[0] && !strchr(fileName, '?')
+			&& ((source.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || SamePathExtension(std::string(fileName), std::string(alternateName))) )
 		{
 			strncpy_s( fileName, sizeof(fileName), alternateName, _TRUNCATE );
 		}
@@ -1647,6 +1839,7 @@ bool CopyFindDataWToA( const WIN32_FIND_DATAW& source, const std::wstring& paren
 			auto alias = Utility::GetOrCreateAsciiAlias( fullWide, parentDirAnsi );
 			if( !alias.empty() )
 			{
+				Utility::RememberLossyDisplayName(alias, fullWide, true);
 				auto slashPos = alias.find_last_of( '\\' );
 				auto leafOnly = slashPos == std::string::npos ? alias : alias.substr( slashPos + 1 );
 				strncpy_s( fileName, sizeof(fileName), leafOnly.c_str(), _TRUNCATE );
@@ -1659,11 +1852,8 @@ bool CopyFindDataWToA( const WIN32_FIND_DATAW& source, const std::wstring& paren
 	return destination->cFileName[0] != '\0';
 }
 
-// cFileName may come back from the OS with '?' standing in for characters that don't fit
-// CP932. Prefer the 8.3 alternate name when one exists; when it doesn't (8.3 name generation
-// disabled on this volume, or none applicable), fall back to a junction/hard-link alias -
-// otherwise callers like Leeyes' own directory-tree code end up processing a name that is
-// mostly '?' placeholders, which is what actually crashes it on some real-world folder names.
+// Use a short name only if it preserves the extension used for format
+// selection. Otherwise resolve the exact entry and give it a virtual alias.
 void FixupFindData( const std::wstring& parentDirWide, const std::string& parentDirAnsi,
 	LPWIN32_FIND_DATA lpFindFileData )
 {
@@ -1675,6 +1865,8 @@ void FixupFindData( const std::wstring& parentDirWide, const std::string& parent
 	bool pathTooLong = HasPathLengthIssue(parentDirAnsi, lpFindFileData->cFileName);
 	if( !hasUnknown && !pathTooLong ) return;
 	std::string damagedName = lpFindFileData->cFileName;
+	std::wstring exactWide;
+	bool exactAvailable = false;
 	if( hasUnknown && !parentDirAnsi.empty() )
 	{
 		// The ANSI result may contain both a '?' replacement and a CP932
@@ -1682,9 +1874,9 @@ void FixupFindData( const std::wstring& parentDirWide, const std::string& parent
 		// by comparing the best-fit byte spelling against the real W directory
 		// entries. When the result is unique, retain the original UTF-16 name
 		// solely for display; cFileName remains the old ANSI/alternate value.
-		std::wstring exactWide;
 		if( Utility::ResolveAnsiPathCollision(parentDirAnsi + "\\" + damagedName, exactWide) )
 		{
+			exactAvailable = true;
 			auto wideSlash = exactWide.find_last_of(L"\\/");
 			std::wstring exactLeaf = wideSlash == std::wstring::npos
 				? exactWide : exactWide.substr(wideSlash + 1);
@@ -1693,7 +1885,9 @@ void FixupFindData( const std::wstring& parentDirWide, const std::string& parent
 		}
 	}
 
-	if( lpFindFileData->cAlternateFileName[0] )
+	if( lpFindFileData->cAlternateFileName[0]
+		&& ((lpFindFileData->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+			|| SamePathExtension(damagedName, std::string(lpFindFileData->cAlternateFileName))) )
 	{
 		::strncpy_s(lpFindFileData->cFileName,lpFindFileData->cAlternateFileName ,14);
 		return;
@@ -1701,21 +1895,30 @@ void FixupFindData( const std::wstring& parentDirWide, const std::string& parent
 
 	if( parentDirWide.empty() ) return;
 
-	// cFileName's '?' characters are already valid single-character wildcards for
-	// FindFirstFileW; everything else just needs converting back to its real wide form.
-	wchar_t widePattern[MAX_PATH] = {};
-	if( !::MultiByteToWideChar( 932, 0, lpFindFileData->cFileName, -1, widePattern, MAX_PATH ) ) return;
-
-	std::wstring fullPattern = parentDirWide + L"\\" + widePattern;
-	WIN32_FIND_DATAW wideFindData = {};
-	HANDLE hFind = Utility::FindFirstFileWLong( fullPattern, &wideFindData );
-	if( hFind == INVALID_HANDLE_VALUE ) return;
-	::FindClose( hFind );
-
-	std::wstring fullWide = parentDirWide + L"\\" + wideFindData.cFileName;
-	auto alias = Utility::GetOrCreateAsciiAlias( fullWide, parentDirAnsi );
+	// A short name identifies this exact directory entry even when multiple
+	// Unicode names collapse to the same ANSI spelling. Do not choose the first
+	// match of a wildcard when no unambiguous identity is available.
+	if( lpFindFileData->cAlternateFileName[0] )
+	{
+		wchar_t shortName[14] = {};
+		if( ::MultiByteToWideChar(932, MB_ERR_INVALID_CHARS, lpFindFileData->cAlternateFileName,
+			-1, shortName, _countof(shortName)) )
+		{
+			WIN32_FIND_DATAW data = {};
+			HANDLE hFind = Utility::FindFirstFileWLong(parentDirWide + L"\\" + shortName, &data);
+			if( hFind != INVALID_HANDLE_VALUE )
+			{
+				::FindClose(hFind);
+				exactWide = parentDirWide + L"\\" + data.cFileName;
+				exactAvailable = true;
+			}
+		}
+	}
+	if( !exactAvailable ) return;
+	auto alias = Utility::GetOrCreateAsciiAlias( exactWide, parentDirAnsi );
 	if( !alias.empty() )
 	{
+		Utility::RememberLossyDisplayName(alias, exactWide, true);
 		auto slashPos = alias.find_last_of( '\\' );
 		auto leafOnly = slashPos == std::string::npos ? alias : alias.substr( slashPos + 1 );
 		::strncpy_s(lpFindFileData->cFileName, leafOnly.c_str(), leafOnly.size());
@@ -1889,6 +2092,9 @@ BOOL  WINAPI FindNextFileHook(HANDLE hFindFile,       LPWIN32_FIND_DATA lpFindFi
 	bool hasContext = contextEntry != nullptr;
 	SearchContext context;
 	if( contextEntry ) context = contextEntry->context;
+	#if UNICODEHACK_PATH_DEBUG
+	if( hasContext && context.wideEnumeration ) ++EnumerationDiagnostic::ansiEnumerationNext;
+	#endif
 
 	WIN32_FIND_DATAW wideFindData = {};
 	BOOL ret = (hasContext && context.wideEnumeration)
@@ -2160,6 +2366,82 @@ void hookCreateFileA()
 		fprintf(lf, "hookCreateFileA install %s\n", originalCreateFileA ? "OK" : "FAILED");
 		fclose(lf);
 	}
+}
+
+// Synthetic names exist only inside this process. A child such as ffmpeg
+// cannot resolve them through our file hooks, so pass the real Unicode path
+// when a complete command-line argument names a registered synthetic path.
+typedef BOOL (WINAPI *CreateProcessAFPtr)(LPCSTR, LPSTR, LPSECURITY_ATTRIBUTES,
+ LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCSTR, LPSTARTUPINFOA, LPPROCESS_INFORMATION);
+CreateProcessAFPtr originalCreateProcessA = nullptr;
+
+bool AnsiToProcessWide(const char* text, std::wstring& result)
+{
+ if (!text) { result.clear(); return true; }
+ int n = MultiByteToWideChar(CP_ACP, 0, text, -1, nullptr, 0);
+ if (!n) return false;
+ std::vector<wchar_t> buffer(n);
+ if (!MultiByteToWideChar(CP_ACP, 0, text, -1, buffer.data(), n)) return false;
+ result.assign(buffer.data());
+ return true;
+}
+
+BOOL WINAPI CreateProcessAHook(LPCSTR application, LPSTR command,
+ LPSECURITY_ATTRIBUTES processAttributes, LPSECURITY_ATTRIBUTES threadAttributes,
+ BOOL inheritHandles, DWORD flags, LPVOID environment, LPCSTR currentDirectory,
+ LPSTARTUPINFOA startup, LPPROCESS_INFORMATION processInfo)
+{
+ if (command && startup && !(flags & EXTENDED_STARTUPINFO_PRESENT))
+ {
+  std::string input(command);
+  std::wstring converted;
+  bool replaced = false, valid = true;
+  size_t pos = 0;
+  while (pos < input.size())
+  {
+   size_t start = pos;
+   bool quoted = input[pos] == '"';
+   if (quoted) ++pos;
+   size_t tokenStart = pos;
+   while (pos < input.size() && (quoted ? input[pos] != '"' : input[pos] != ' ' && input[pos] != '\t')) ++pos;
+   std::string token = input.substr(tokenStart, pos - tokenStart);
+   std::wstring value;
+   if (Utility::LookupSyntheticPathAlias(token, value)) replaced = true;
+   else if (!AnsiToProcessWide(token.c_str(), value)) { valid = false; break; }
+   if (quoted) converted += L'"';
+   converted += value;
+   if (quoted && pos < input.size()) { converted += L'"'; ++pos; }
+   if (pos == start) { converted += static_cast<unsigned char>(input[pos]); ++pos; }
+  }
+  if (replaced && valid)
+  {
+   std::wstring app, dir, reserved, desktop, title;
+   if (AnsiToProcessWide(application, app) && AnsiToProcessWide(currentDirectory, dir) &&
+       AnsiToProcessWide(startup->lpReserved, reserved) && AnsiToProcessWide(startup->lpDesktop, desktop) &&
+       AnsiToProcessWide(startup->lpTitle, title))
+   {
+    STARTUPINFOW wide = {};
+    wide.cb = sizeof(wide);
+    wide.lpReserved = startup->lpReserved ? const_cast<LPWSTR>(reserved.c_str()) : nullptr;
+    wide.lpDesktop = startup->lpDesktop ? const_cast<LPWSTR>(desktop.c_str()) : nullptr;
+    wide.lpTitle = startup->lpTitle ? const_cast<LPWSTR>(title.c_str()) : nullptr;
+    wide.dwX=startup->dwX; wide.dwY=startup->dwY; wide.dwXSize=startup->dwXSize; wide.dwYSize=startup->dwYSize;
+    wide.dwXCountChars=startup->dwXCountChars; wide.dwYCountChars=startup->dwYCountChars;
+    wide.dwFillAttribute=startup->dwFillAttribute; wide.dwFlags=startup->dwFlags;
+    wide.wShowWindow=startup->wShowWindow; wide.cbReserved2=startup->cbReserved2; wide.lpReserved2=startup->lpReserved2;
+    wide.hStdInput=startup->hStdInput; wide.hStdOutput=startup->hStdOutput; wide.hStdError=startup->hStdError;
+    return CreateProcessW(application ? app.c_str() : nullptr, &converted[0], processAttributes,
+      threadAttributes, inheritHandles, flags, environment, currentDirectory ? dir.c_str() : nullptr, &wide, processInfo);
+   }
+  }
+ }
+ return originalCreateProcessA(application, command, processAttributes, threadAttributes,
+  inheritHandles, flags, environment, currentDirectory, startup, processInfo);
+}
+
+void hookCreateProcessA()
+{
+ originalCreateProcessA = nCodeHook.createHookByName("kernelbase.dll", "CreateProcessA", CreateProcessAHook);
 }
 
 // Diagnostic-only: CreateFileA is the only variant this patch has ever needed to fix up,
@@ -2495,6 +2777,104 @@ void hookGetFileAttributesExA()
 		}
 		return !wide.empty() && wide.find(L'?') == std::wstring::npos
 			&& (!mustExist || Utility::GetFileAttributesWLong(wide) != INVALID_FILE_ATTRIBUTES);
+	}
+
+	// Shell launches can cross a process boundary without calling CreateProcessA
+	// in Leeyes. Restore virtual file names before asking the shell to open them.
+	typedef HINSTANCE (WINAPI *ShellExecuteAFPtr)(HWND, LPCSTR, LPCSTR, LPCSTR, LPCSTR, INT);
+	typedef BOOL (WINAPI *ShellExecuteExAFPtr)(SHELLEXECUTEINFOA*);
+	ShellExecuteAFPtr originalShellExecuteA = nullptr;
+	ShellExecuteExAFPtr originalShellExecuteExA = nullptr;
+
+	bool ResolveShellParameters(LPCSTR input, std::wstring& output, bool& changed)
+	{
+		output.clear(); changed = false;
+		if (!input) return true;
+		std::string args(input);
+		for (size_t pos = 0; pos < args.size(); )
+		{
+			if (args[pos] == ' ' || args[pos] == '\t') { output += args[pos++]; continue; }
+			bool quoted = args[pos] == '"';
+			if (quoted) { output += L'"'; ++pos; }
+			size_t start = pos;
+			while (pos < args.size() && (quoted ? args[pos] != '"' : args[pos] != ' ' && args[pos] != '\t')) ++pos;
+			std::string token = args.substr(start, pos - start);
+			std::wstring wide;
+			if (Utility::LookupSyntheticPathAlias(token, wide)) changed = true;
+			else
+			{
+				if (Utility::HasSyntheticAlias(token)) return false;
+				if (!AnsiToProcessWide(token.c_str(), wide)) return false;
+			}
+			output += wide;
+			if (quoted && pos < args.size()) { output += L'"'; ++pos; }
+		}
+		return true;
+	}
+
+	bool ResolveShellFile(LPCSTR input, std::wstring& wide, bool& unresolvedAlias)
+	{
+		unresolvedAlias = false;
+		if (!input) return false;
+		std::string path(input);
+		// Leeyes may quote lpFile itself, rather than only quoting an argument.
+		// The alias registry stores the path without those surrounding quotes.
+		if (path.size() >= 2 && path.front() == '"' && path.back() == '"')
+			path = path.substr(1, path.size() - 2);
+		bool resolved = ResolveAnsiOperationPath(path.c_str(), true, wide);
+		unresolvedAlias = !resolved && Utility::HasSyntheticAlias(path);
+		return resolved;
+	}
+
+	HINSTANCE WINAPI ShellExecuteAHook(HWND hwnd, LPCSTR operation, LPCSTR file,
+		LPCSTR parameters, LPCSTR directory, INT show)
+	{
+		std::wstring wideFile, wideParameters, wideOperation, wideDirectory;
+		bool unresolvedAlias = false, paramsChanged = false;
+		bool fileChanged = ResolveShellFile(file, wideFile, unresolvedAlias);
+		if (!ResolveShellParameters(parameters, wideParameters, paramsChanged) ||
+			unresolvedAlias)
+		{ SetLastError(ERROR_FILE_NOT_FOUND); return reinterpret_cast<HINSTANCE>(SE_ERR_FNF); }
+		if (!fileChanged && !paramsChanged) return originalShellExecuteA(hwnd, operation, file, parameters, directory, show);
+		if ((!fileChanged && !AnsiToProcessWide(file, wideFile)) ||
+			!AnsiToProcessWide(operation, wideOperation) || !AnsiToProcessWide(directory, wideDirectory))
+		{ SetLastError(ERROR_NO_UNICODE_TRANSLATION); return reinterpret_cast<HINSTANCE>(SE_ERR_FNF); }
+		return ShellExecuteW(hwnd, operation ? wideOperation.c_str() : nullptr, file ? wideFile.c_str() : nullptr,
+			parameters ? wideParameters.c_str() : nullptr, directory ? wideDirectory.c_str() : nullptr, show);
+	}
+
+	BOOL WINAPI ShellExecuteExAHook(SHELLEXECUTEINFOA* info)
+	{
+		if (!info || info->cbSize != sizeof(*info)) return originalShellExecuteExA(info);
+		std::wstring file, parameters, verb, directory, className;
+		bool unresolvedAlias = false, paramsChanged = false;
+		bool fileChanged = ResolveShellFile(info->lpFile, file, unresolvedAlias);
+		if (!ResolveShellParameters(info->lpParameters, parameters, paramsChanged) ||
+			unresolvedAlias)
+		{ SetLastError(ERROR_FILE_NOT_FOUND); return FALSE; }
+		if (!fileChanged && !paramsChanged) return originalShellExecuteExA(info);
+		if ((!fileChanged && !AnsiToProcessWide(info->lpFile, file)) ||
+			!AnsiToProcessWide(info->lpVerb, verb) || !AnsiToProcessWide(info->lpDirectory, directory) ||
+			((info->fMask & SEE_MASK_CLASSKEY) == SEE_MASK_CLASSNAME && !AnsiToProcessWide(info->lpClass, className)))
+		{ SetLastError(ERROR_NO_UNICODE_TRANSLATION); return FALSE; }
+		SHELLEXECUTEINFOW wide = {};
+		wide.cbSize = sizeof(wide); wide.fMask = info->fMask; wide.hwnd = info->hwnd;
+		wide.lpVerb = info->lpVerb ? verb.c_str() : nullptr; wide.lpFile = info->lpFile ? file.c_str() : nullptr;
+		wide.lpParameters = info->lpParameters ? parameters.c_str() : nullptr;
+		wide.lpDirectory = info->lpDirectory ? directory.c_str() : nullptr;
+		wide.nShow = info->nShow; wide.hInstApp = info->hInstApp; wide.lpIDList = info->lpIDList;
+		wide.lpClass = (info->fMask & SEE_MASK_CLASSKEY) == SEE_MASK_CLASSNAME && info->lpClass ? className.c_str() : nullptr;
+		wide.hkeyClass = info->hkeyClass; wide.dwHotKey = info->dwHotKey; wide.hIcon = info->hIcon;
+		wide.hProcess = info->hProcess;
+		BOOL result = ShellExecuteExW(&wide);
+		info->hInstApp = wide.hInstApp; info->hProcess = wide.hProcess;
+		return result;
+	}
+
+	void hookShellExecute()
+	{
+		originalShellExecuteA = nCodeHook.createHookByName("shell32.dll", "ShellExecuteA", ShellExecuteAHook);
+		originalShellExecuteExA = nCodeHook.createHookByName("shell32.dll", "ShellExecuteExA", ShellExecuteExAHook);
 	}
 
 	typedef BOOL (WINAPI *MoveFileAFPtr)(LPCSTR, LPCSTR);
@@ -3072,10 +3452,28 @@ namespace User32
 	void RecordDiagnosticMessage( bool posted, HWND hWnd, UINT message, WPARAM wParam,
 		LPARAM lParam, LPCVOID caller )
 	{
+		// Tree timing needs only tree-control messages; avoid the general debug
+		// probe's per-message class lookups, mutexes and stack samples.
+		if( EnumerationDiagnostic::lightweightTreeTiming
+			&& (posted || message < TV_FIRST || message >= TV_FIRST + 0x80) ) return;
 		char className[64] = {};
 		if( !hWnd || ::GetClassNameA(hWnd, className, sizeof(className)) <= 0 ) return;
 		bool isMainForm = strcmp(className, "TMainForm") == 0;
 		bool isListView = strcmp(className, "TAcvListView") == 0;
+		if( !posted && strcmp(className, "TAcvTreeView") == 0
+			&& message >= TV_FIRST && message < TV_FIRST + 0x80 )
+		{
+			if( message == TVM_GETNEXTITEM ) ++EnumerationDiagnostic::treeNext;
+			else if( message == TVM_GETITEMA || message == TVM_GETITEMW )
+				++EnumerationDiagnostic::treeGetItem;
+			else if( message == TVM_INSERTITEMA || message == TVM_INSERTITEMW )
+				++EnumerationDiagnostic::treeInsert;
+			else if( message == TVM_DELETEITEM ) ++EnumerationDiagnostic::treeDelete;
+			else if( message == TVM_SETITEMA || message == TVM_SETITEMW )
+				++EnumerationDiagnostic::treeSetItem;
+			else ++EnumerationDiagnostic::treeOther;
+		}
+		if( EnumerationDiagnostic::lightweightTreeTiming ) return;
 		ULONGLONG watcherTick = Kernel32::Perf::lastTestWatcherCompletionTick.load();
 		bool nearWatcherCompletion = watcherTick != 0
 			&& ::GetTickCount64() - watcherTick < 1000;
@@ -3938,7 +4336,7 @@ UINT WINAPI DragQueryFileWHook( __in HDROP hDrop, __in UINT iFile, __out_ecount_
 	if( legacyPath.empty() || legacyPath == originalPath ) return originalSize;
 
 	#if UNICODEHACK_PATH_DEBUG
-	if( originalPath.find(L"neekosan") != std::wstring::npos )
+	if( DebugPathMatches(originalPath.c_str()) )
 	{
 		FILE* lf = nullptr;
 		if( Utility::OpenDebugLog(&lf) )
@@ -3987,7 +4385,7 @@ UINT   WINAPI DragQueryFileAHook( __in HDROP hDrop, __in UINT iFile, __out_ecoun
 		{
 			fprintf(lf, "DragQueryFileA call i=%u cch=%u size=%u hasBuffer=%s\n",
 				iFile, cch, size, lpszFile ? "yes" : "no");
-			if( lpszFile && strstr(lpszFile, "neekosan") )
+			if( DebugPathMatches(lpszFile) )
 			{
 				fprintf(lf, "DragQueryFileA path=[%s] bytes=", lpszFile);
 				for( const unsigned char* p = reinterpret_cast<const unsigned char*>(lpszFile); *p; ++p )
@@ -5257,6 +5655,8 @@ __declspec(naked) int __stdcall IsSupportedDispatch()
 		jz image_plugin_direct
 		cmp byte ptr [edx], '?'
 		je image_plugin_alias
+		cmp byte ptr [edx], '~'
+		je image_plugin_alias
 		inc edx
 		inc ecx
 		cmp ecx, 103h
@@ -5289,6 +5689,8 @@ __declspec(naked) int __stdcall GetPictureInfoDispatch()
 		cmp byte ptr [edx], 0
 		jz image_info_direct
 		cmp byte ptr [edx], '?'
+		je image_info_alias
+		cmp byte ptr [edx], '~'
 		je image_info_alias
 		inc edx
 		inc ecx
@@ -5335,6 +5737,8 @@ __declspec(naked) int __stdcall GetPictureDispatch()
 		cmp byte ptr [edx], 0
 		jz image_picture_direct
 		cmp byte ptr [edx], '?'
+		je image_picture_alias
+		cmp byte ptr [edx], '~'
 		je image_picture_alias
 		inc edx
 		inc ecx
@@ -5451,42 +5855,6 @@ GetProcAddressFPtr originalGetProcAddress = nullptr;
 	return true;
  }
 
-bool IsTargetImagePlugin( HMODULE hModule, char* moduleName, size_t moduleNameSize )
-{
-	if( !hModule || !moduleName || moduleNameSize == 0 ) return false;
-	moduleName[0] = '\0';
-	if( !GetModuleFileNameA( hModule, moduleName, (DWORD)moduleNameSize ) ) return false;
-	const char* fileName = strrchr( moduleName, '\\' );
-	const char* slash = strrchr( moduleName, '/' );
-	if( slash && (!fileName || slash > fileName) ) fileName = slash;
-	if( fileName ) ++fileName;
-	else fileName = moduleName;
-
-	static const char* const targetNames[] =
-	{
-		"iftwebp.spi",
-		"ifjpegx.spi",
-		"ifpng.spi",
-		"ifavif.spi",
-		"wic_loader.spi",
-		"axffmpeg.spi"
-	};
-	for( const auto targetName : targetNames )
-		if( _stricmp(fileName, targetName) == 0 ) return true;
-	return false;
-}
-
-bool IsWebpImagePlugin( const char* moduleName )
-{
-	if( !moduleName ) return false;
-	const char* fileName = strrchr( moduleName, '\\' );
-	const char* slash = strrchr( moduleName, '/' );
-	if( slash && (!fileName || slash > fileName) ) fileName = slash;
-	if( fileName ) ++fileName;
-	else fileName = moduleName;
-	return _stricmp(fileName, "iftwebp.spi") == 0;
-}
-
 void* GetImageDispatch( const char* procName )
 {
 	if( strcmp(procName, "IsSupported") == 0 ) return reinterpret_cast<void*>(&IsSupportedDispatch);
@@ -5521,8 +5889,6 @@ FARPROC WrapImagePluginFunction( HMODULE hModule, const char* procName, FARPROC 
 		const bool isImageProc = procNameIsString && (strcmp(lpProcName, "IsSupported") == 0
 			|| strcmp(lpProcName, "GetPictureInfo") == 0
 			|| strcmp(lpProcName, "GetPicture") == 0);
-		const bool isTargetImagePlugin = isImageProc
-			&& IsTargetImagePlugin( hModule, moduleName, sizeof(moduleName) );
 		const bool isArchiveEntryProc = procNameIsString && (strcmp(lpProcName, "GetArchiveInfo") == 0
 			|| strcmp(lpProcName, "GetFileInfo") == 0
 			|| strcmp(lpProcName, "GetFile") == 0);
@@ -5530,6 +5896,8 @@ FARPROC WrapImagePluginFunction( HMODULE hModule, const char* procName, FARPROC 
 		if( moduleFileName ) ++moduleFileName;
 		else moduleFileName = moduleName;
 		const char* moduleExtension = strrchr(moduleFileName, '.');
+		const bool isTargetImagePlugin = isImageProc && moduleExtension
+			&& _stricmp(moduleExtension, ".spi") == 0;
 		const bool isKnownArchiveModule = _stricmp(moduleFileName, "arc.spi") == 0
 			|| _stricmp(moduleFileName, "ax7z.spi") == 0
 			|| _stricmp(moduleFileName, "axpdf.spi") == 0
@@ -5560,12 +5928,9 @@ FARPROC WrapImagePluginFunction( HMODULE hModule, const char* procName, FARPROC 
 		// hook. Leeyes calls the pointer returned by GetProcAddress, so this keeps
 		// each plugin's original function and supports all configured image plugins
 		// concurrently.
-		// IsSupported is called while Leeyes probes every file in a list. Keep that
-		// hot path untouched for the newly added plugins; their GetPictureInfo and
-		// GetPicture calls still receive the Unicode fallback when an actual image
-		// path is damaged. WebP keeps its previously verified IsSupported fallback.
-		const bool shouldWrapFunction = isTargetImagePlugin
-			&& (strcmp(lpProcName, "IsSupported") != 0 || IsWebpImagePlugin(moduleName));
+		// Every Susie image plugin uses the same ANSI path ABI. The dispatcher
+		// keeps ordinary paths on its direct path and repairs aliases only when needed.
+		const bool shouldWrapFunction = isTargetImagePlugin;
 		if( ret && shouldWrapFunction )
 			return WrapImagePluginFunction( hModule, lpProcName, ret, moduleName );
 		return ret;
@@ -5655,11 +6020,91 @@ bool IsActionableExceptionCode( DWORD code )
 	}
 }
 
+#if UNICODEHACK_STARTUP_DIAGNOSTICS
+size_t ReadFaultStackWords(const CONTEXT* context, DWORD* words, size_t capacity)
+{
+	if( !context || !words || context->Esp < 0x10000 || capacity == 0 ) return 0;
+	__try
+	{
+		const volatile DWORD* source = reinterpret_cast<const volatile DWORD*>(context->Esp);
+		for( size_t index = 0; index < capacity; ++index ) words[index] = source[index];
+		return capacity;
+	}
+	__except( EXCEPTION_EXECUTE_HANDLER ) { return 0; }
+}
+#endif
+
 LONG WINAPI VectoredHandler(PEXCEPTION_POINTERS info)
 {
-	if( !info || !info->ExceptionRecord
-		|| !IsActionableExceptionCode(info->ExceptionRecord->ExceptionCode) )
+	if( !info || !info->ExceptionRecord )
 		return EXCEPTION_CONTINUE_SEARCH;
+	const bool actionable = IsActionableExceptionCode(info->ExceptionRecord->ExceptionCode);
+	#if UNICODEHACK_STARTUP_DIAGNOSTICS
+	const bool startupEnabled = ::InterlockedCompareExchange(&gStartupDiagnosticEnabled, 0, 0) != 0;
+	const bool delphiException =
+		(info->ExceptionRecord->ExceptionCode & 0xFFFFFF00UL) == 0x0EEDFA00UL;
+	if( !actionable && !(startupEnabled && delphiException) )
+	#else
+	if( !actionable )
+	#endif
+		return EXCEPTION_CONTINUE_SEARCH;
+	#if UNICODEHACK_STARTUP_DIAGNOSTICS
+	if( startupEnabled )
+	{
+		if( ::InterlockedCompareExchange(&gStartupDiagnosticExceptionHandling, 1, 0) != 0 )
+			return EXCEPTION_CONTINUE_SEARCH;
+		LONG ordinal = ::InterlockedIncrement(&gStartupDiagnosticExceptionCount);
+		if( ordinal <= 64 )
+		{
+			const CONTEXT* context = info->ContextRecord;
+			ULONG_PTR address = reinterpret_cast<ULONG_PTR>(info->ExceptionRecord->ExceptionAddress);
+			char detail[512] = {};
+			sprintf_s(detail,
+				"first_chance=%ld code=0x%08lX eip=0x%08lX"
+				" eax=0x%08lX ebx=0x%08lX ecx=0x%08lX edx=0x%08lX"
+				" esi=0x%08lX edi=0x%08lX ebp=0x%08lX esp=0x%08lX"
+				" av_address=0x%08lX",
+				ordinal,
+				static_cast<unsigned long>(info->ExceptionRecord->ExceptionCode),
+				static_cast<unsigned long>(address),
+				static_cast<unsigned long>(context ? context->Eax : 0),
+				static_cast<unsigned long>(context ? context->Ebx : 0),
+				static_cast<unsigned long>(context ? context->Ecx : 0),
+				static_cast<unsigned long>(context ? context->Edx : 0),
+				static_cast<unsigned long>(context ? context->Esi : 0),
+				static_cast<unsigned long>(context ? context->Edi : 0),
+				static_cast<unsigned long>(context ? context->Ebp : 0),
+				static_cast<unsigned long>(context ? context->Esp : 0),
+				static_cast<unsigned long>(info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION
+					&& info->ExceptionRecord->NumberParameters >= 2
+					? info->ExceptionRecord->ExceptionInformation[1] : 0));
+			if( info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION
+				|| delphiException )
+			{
+				DWORD words[8] = {};
+				size_t count = ReadFaultStackWords(context, words, _countof(words));
+				size_t used = strlen(detail);
+				for( size_t index = 0; index < count; ++index )
+				{
+					int added = sprintf_s(detail + used, _countof(detail) - used,
+						" sp%u=0x%08lX", static_cast<unsigned int>(index),
+						static_cast<unsigned long>(words[index]));
+					if( added <= 0 ) break;
+					used += static_cast<size_t>(added);
+				}
+			}
+			StartupDiagnosticLog("exception", detail);
+		}
+		else if( ordinal == 65 ) StartupDiagnosticLog("exception_limit", "first 64 recorded");
+	}
+	#endif
+	if( !actionable )
+	{
+		#if UNICODEHACK_STARTUP_DIAGNOSTICS
+		if( startupEnabled ) ::InterlockedExchange(&gStartupDiagnosticExceptionHandling, 0);
+		#endif
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
 	FILE* f = nullptr;
 	if (Utility::OpenFailureLog(&f))
 	{
@@ -5690,6 +6135,22 @@ LONG WINAPI VectoredHandler(PEXCEPTION_POINTERS info)
 					info->ExceptionRecord->ExceptionInformation[0]),
 				reinterpret_cast<void*>(static_cast<ULONG_PTR>(
 					info->ExceptionRecord->ExceptionInformation[1])));
+		#if UNICODEHACK_PATH_DEBUG
+		if( reinterpret_cast<ULONG_PTR>(info->ExceptionRecord->ExceptionAddress) == 0x004C9662
+			&& ::GetEnvironmentVariableA("LEYEES_TREE_BATCH_STATE_GATE", nullptr, 0) )
+		{
+			__try {
+				const BYTE* code = reinterpret_cast<const BYTE*>(0x004C965B);
+				fprintf(f, " code_4c965b=");
+				for( unsigned i = 0; i < 16; ++i ) fprintf(f, "%02X", code[i]);
+				if( info->ContextRecord ) {
+					const DWORD* words = reinterpret_cast<const DWORD*>(info->ContextRecord->Esp);
+					fprintf(f, " fault_stack=");
+					for( unsigned i = 0; i < 12; ++i ) fprintf(f, "%08lX,", static_cast<unsigned long>(words[i]));
+				}
+			} __except( EXCEPTION_EXECUTE_HANDLER ) { fprintf(f, " code_unreadable"); }
+		}
+		#endif
 		fprintf(f, " stack:");
 		void* stack[24] = {};
 		USHORT n = CaptureStackBackTrace(0, 24, stack, nullptr);
@@ -5697,6 +6158,9 @@ LONG WINAPI VectoredHandler(PEXCEPTION_POINTERS info)
 		fprintf(f, "\n");
 		fclose(f);
 	}
+	#if UNICODEHACK_STARTUP_DIAGNOSTICS
+	if( startupEnabled ) ::InterlockedExchange(&gStartupDiagnosticExceptionHandling, 0);
+	#endif
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 }
@@ -5728,9 +6192,17 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 		{
 			Profile.reset( new ProfileAccessor( hModule ) );
 			ArchivePluginName = Profile->Get("Archive","FileName", "ax7z.spi");
+		#if UNICODEHACK_STARTUP_DIAGNOSTICS
+			::InterlockedExchange(&gStartupDiagnosticEnabled,
+				Profile->Get("Debug", "StartupLog", UINT()) != 0 ? 1 : 0);
+		#endif
 		#if UNICODEHACK_PATH_DEBUG || UNICODEHACK_PLUGIN_DEBUG
 			Utility::gDebugLogEnabled = Profile->Get("Debug", "DebugLog", UINT()) != 0;
 			Utility::gFailureLogEnabled = Profile->Get("Debug", "FailureLog", UINT()) != 0;
+		#endif
+		#if UNICODEHACK_PATH_DEBUG
+			EnumerationDiagnostic::lightweightTreeTiming =
+				Profile->Get("InternalHook", "TreeTiming", UINT()) != 0;
 		#endif
 		#if UNICODEHACK_PLUGIN_DEBUG
 			SusieAM00::gImagePluginSummaryEnabled =
@@ -5749,6 +6221,8 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 		#endif
 		}
 		{//���Ƀt�@�C���Ή��p
+			Kernel32::hookCreateProcessA();
+			Kernel32::hookShellExecute();
 			Kernel32::hookCreateFileA();
 			Kernel32::hookCreateFileW();
 			Kernel32::hookCreateFile2();

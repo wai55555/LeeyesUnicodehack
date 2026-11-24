@@ -18,6 +18,8 @@
 #include <commctrl.h>
 #include <dbghelp.h>
 #include <psapi.h>
+#include "../common/state_snapshot_child.h"
+#include "../common/watched_snapshot_stream.h"
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "dbghelp.lib")
@@ -25,6 +27,10 @@
 
 #ifndef UNICODEHACK_SWEEP_DIAGNOSTICS
 #define UNICODEHACK_SWEEP_DIAGNOSTICS 0
+#endif
+
+#ifndef UNICODEHACK_STARTUP_DIAGNOSTICS
+#define UNICODEHACK_STARTUP_DIAGNOSTICS 0
 #endif
 
 
@@ -37,6 +43,33 @@ static bool gBackgroundLaunch = false;
 static HDESK gSweepDesktop = NULL;
 static std::wstring gSweepDesktopName;
 static std::wstring gSweepDesktopPath;
+
+#if UNICODEHACK_STARTUP_DIAGNOSTICS
+static bool gStartupDiagnosticEnabled = false;
+static std::wstring gStartupDiagnosticPath;
+
+static void WriteStartupDiagnostic(const char* stage, const char* detail = "")
+{
+	if( !gStartupDiagnosticEnabled || !stage ) return;
+	HANDLE file = ::CreateFileW(gStartupDiagnosticPath.c_str(), FILE_APPEND_DATA,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if( file == INVALID_HANDLE_VALUE ) return;
+	char line[512] = {};
+	int count = sprintf_s(line, "tick_ms=%llu pid=%lu tid=%lu source=launcher stage=%s %s\r\n",
+		static_cast<unsigned long long>(::GetTickCount64()),
+		static_cast<unsigned long>(::GetCurrentProcessId()),
+		static_cast<unsigned long>(::GetCurrentThreadId()), stage, detail ? detail : "");
+	if( count > 0 )
+	{
+		DWORD written = 0;
+		::WriteFile(file, line, static_cast<DWORD>(count), &written, nullptr);
+	}
+	::CloseHandle(file);
+}
+#else
+static void WriteStartupDiagnostic(const char*, const char* = "") {}
+#endif
 
 class SweepLogger
 {
@@ -1984,6 +2017,38 @@ static LPVOID CreatePreEntryBootstrap(Process& process, LPVOID remoteDllPath,
 
 int _tmain(int argc, _TCHAR* argv[])
 {
+	if( argc >= 2 && _tcsicmp(argv[1], TEXT("--internal-state-watch")) == 0 )
+	{
+		if( argc != 4 && argc != 5 && argc != 6 ) return 2;
+		if( argc == 6 && _tcscmp(argv[5], TEXT("--entry-identities")) != 0 ) return 2;
+		#if UNICODEHACK_SWEEP_DIAGNOSTICS
+		if( ::GetEnvironmentVariableW(L"LEYEES_STATE_WATCH_TEST_STALL", nullptr, 0) ) ::Sleep(INFINITE);
+		#endif
+		_TCHAR* end = nullptr;
+		const unsigned __int64 value = _tcstoui64(argv[2], &end, 10);
+		if( !value || !end || *end || value > static_cast<unsigned __int64>(MAXDWORD) ) return 2;
+		unsigned __int64 control = 0;
+		if( argc >= 5 )
+		{
+			end = nullptr; control = _tcstoui64(argv[4], &end, 10);
+			if( !control || !end || *end || control > static_cast<unsigned __int64>(MAXDWORD) ) return 2;
+		}
+		return WatchedSnapshotStream::RunChild(reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(value)), argv[3],
+			reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(control)), argc == 6);
+	}
+	if( argc >= 2 && _tcsicmp(argv[1], TEXT("--internal-state-snapshot")) == 0 )
+	{
+		#if UNICODEHACK_SWEEP_DIAGNOSTICS
+		if( ::GetEnvironmentVariableW(L"LEYEES_STATE_TEST_CHILD_FAIL", nullptr, 0) ) return 3;
+		if( argc == 4 && ::GetEnvironmentVariableW(L"LEYEES_STATE_TEST_DEST_FAIL", nullptr, 0)
+			&& _tcsstr(argv[3], TEXT("\\folder_destination")) ) return 3;
+		#endif
+		if( argc != 4 ) return 2;
+		_TCHAR* end = nullptr;
+		const unsigned __int64 value = _tcstoui64(argv[2], &end, 10);
+		if( !value || !end || *end || value > static_cast<unsigned __int64>(MAXDWORD) ) return 2;
+		return SnapshotWire::RunChild(reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(value)), argv[3]);
+	}
 	/*if (argc != 3)
 	{
 		std::cout << "Usage is: simple_example executable dll" << std::endl;
@@ -2049,6 +2114,28 @@ int _tmain(int argc, _TCHAR* argv[])
 	{
 		abort();
 	}
+	#if UNICODEHACK_STARTUP_DIAGNOSTICS
+	const std::wstring startupIni = std::wstring(current_dir) + L"inject_dll.ini";
+	gStartupDiagnosticEnabled = ::GetPrivateProfileIntW(L"Debug", L"StartupLog", 0,
+		startupIni.c_str()) != 0;
+	if( gStartupDiagnosticEnabled )
+	{
+		gStartupDiagnosticPath = std::wstring(current_dir) + L"Leeyes_startup_diagnostic.txt";
+		WIN32_FILE_ATTRIBUTE_DATA exeData = {};
+		WIN32_FILE_ATTRIBUTE_DATA dllData = {};
+		bool exeFound = ::GetFileAttributesExW(path, GetFileExInfoStandard, &exeData) != 0;
+		bool dllFound = ::GetFileAttributesExW(dllFullPath, GetFileExInfoStandard, &dllData) != 0;
+		char inputs[128] = {};
+		sprintf_s(inputs, "exe_found=%d exe_bytes=%llu dll_found=%d dll_bytes=%llu",
+			exeFound ? 1 : 0,
+			exeFound ? (static_cast<unsigned long long>(exeData.nFileSizeHigh) << 32)
+				| exeData.nFileSizeLow : 0ULL,
+			dllFound ? 1 : 0,
+			dllFound ? (static_cast<unsigned long long>(dllData.nFileSizeHigh) << 32)
+				| dllData.nFileSizeLow : 0ULL);
+		WriteStartupDiagnostic("launch_begin", inputs);
+	}
+	#endif
 	std::unique_ptr<SweepLogger> sweepLogger;
 	#if UNICODEHACK_SWEEP_DIAGNOSTICS
 	if( sweepMode )
@@ -2093,6 +2180,11 @@ int _tmain(int argc, _TCHAR* argv[])
 
 	if (CreateProcess(path, NULL, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, current_dir, &sInfo, &pInfo))
 	{
+		#if UNICODEHACK_STARTUP_DIAGNOSTICS
+		char childDetail[96] = {};
+		sprintf_s(childDetail, "child_pid=%lu", static_cast<unsigned long>(pInfo.dwProcessId));
+		WriteStartupDiagnostic("child_created_suspended", childDetail);
+		#endif
 		try
 		{
 			Process process(pInfo.dwProcessId);
@@ -2135,10 +2227,12 @@ int _tmain(int argc, _TCHAR* argv[])
 			ctx.Eip = reinterpret_cast<DWORD>(CreatePreEntryBootstrap(
 				process, remoteDllPath, originalEntryPoint, pLoadLibrary, pGetProcAddress));
 			if (!SetThreadContext(pInfo.hThread, &ctx)) throw std::exception("SetThreadContext failed");
+			WriteStartupDiagnostic("bootstrap_prepared", "DLL load precedes original entry");
 
 			if( ResumeThread(pInfo.hThread) == static_cast<DWORD>(-1) )
 				throw std::exception("ResumeThread failed");
 			childResumed = true;
+			WriteStartupDiagnostic("child_resumed", "primary thread running");
 			if( backgroundLaunch )
 			{
 				watchdog.reset(new SweepWatchdog(pInfo.dwProcessId, sweepLogger.get()));
@@ -2253,6 +2347,19 @@ int _tmain(int argc, _TCHAR* argv[])
 				#endif
 			}
 			std::cout << "DLL successfully injected" << std::endl;
+			#if UNICODEHACK_STARTUP_DIAGNOSTICS
+			if( gStartupDiagnosticEnabled && !option && !sweepMode )
+			{
+				DWORD idle = ::WaitForInputIdle(pInfo.hProcess, 10000);
+				HWND mainWindow = GetWindowHandle(pInfo.dwProcessId);
+				DWORD exited = ::WaitForSingleObject(pInfo.hProcess, 0);
+				char state[128] = {};
+				sprintf_s(state, "input_idle=%lu main_form=%d child_exited=%d",
+					static_cast<unsigned long>(idle), mainWindow ? 1 : 0,
+					exited == WAIT_OBJECT_0 ? 1 : 0);
+				WriteStartupDiagnostic("startup_observation", state);
+			}
+			#endif
 		}
 		catch (std::exception& e)
 		{
@@ -2261,6 +2368,7 @@ int _tmain(int argc, _TCHAR* argv[])
 			if( sweepLogger ) sweepLogger->Write(L"sweep_error exception=std_exception", true);
 			#endif
 			std::cout << "Error while trying to inject dll into process: " << e.what() << std::endl;
+			WriteStartupDiagnostic("launcher_error", e.what());
 			if( watchdog ) watchdog->Stop();
 			if( !childResumed ) ResumeThread(pInfo.hThread);
 			#if UNICODEHACK_SWEEP_DIAGNOSTICS
@@ -2281,6 +2389,11 @@ int _tmain(int argc, _TCHAR* argv[])
 		DWORD lastErr = GetLastError();
 		launcherExitCode = 1;
 		std::cout << "Failed to start process, system error: " << lastErr << std::endl;
+		#if UNICODEHACK_STARTUP_DIAGNOSTICS
+		char errorDetail[64] = {};
+		sprintf_s(errorDetail, "win32_error=%lu", static_cast<unsigned long>(lastErr));
+		WriteStartupDiagnostic("create_process_failed", errorDetail);
+		#endif
 	}
 	if( gSweepDesktop )
 	{
