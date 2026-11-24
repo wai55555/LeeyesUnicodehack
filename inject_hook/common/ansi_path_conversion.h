@@ -12,8 +12,9 @@ inline bool ExactAnsiPath(UINT codePage, const wchar_t* path, char* output, int 
 	output[0] = '\0';
 	if( !path || !*path ) return false;
 	BOOL usedDefault = FALSE;
-	const int bytes = ::WideCharToMultiByte(codePage, WC_NO_BEST_FIT_CHARS, path, -1,
-		output, capacity, nullptr, &usedDefault);
+	const bool utf8 = codePage == CP_UTF8;
+	const int bytes = ::WideCharToMultiByte(codePage, utf8 ? 0 : WC_NO_BEST_FIT_CHARS, path, -1,
+		output, capacity, nullptr, utf8 ? nullptr : &usedDefault);
 	if( !bytes || usedDefault ) { output[0] = '\0'; return false; }
 	wchar_t restored[MAX_PATH] = {};
 	const int units = ::MultiByteToWideChar(codePage, 0, output, bytes, restored, _countof(restored));

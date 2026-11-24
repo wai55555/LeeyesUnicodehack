@@ -2386,6 +2386,174 @@ bool AnsiToProcessWide(const char* text, std::wstring& result)
  return true;
 }
 
+bool IsCommandLineSpace(unsigned char value)
+{
+ return value == ' ' || value == '\t';
+}
+
+bool IsCommandLineLeadByte(unsigned char value)
+{
+ return ::IsDBCSLeadByteEx(CP_ACP, value) != FALSE;
+}
+
+bool DecodeCommandLineArgument(const std::string& input, size_t& position,
+	std::string& argument, bool executableName)
+{
+ while (position < input.size() && IsCommandLineSpace(static_cast<unsigned char>(input[position]))) ++position;
+ if (position == input.size()) return false;
+
+ argument.clear();
+ if (executableName)
+ {
+  const bool quotedExecutable = input[position] == '"';
+  if (quotedExecutable) ++position;
+  while (position < input.size())
+  {
+   const unsigned char value = static_cast<unsigned char>(input[position]);
+   if (IsCommandLineLeadByte(value) && position + 1 < input.size())
+   {
+    argument.push_back(input[position++]);
+    argument.push_back(input[position++]);
+    continue;
+   }
+   if (quotedExecutable ? value == '"' : IsCommandLineSpace(value))
+   {
+    if (quotedExecutable) ++position;
+    break;
+   }
+   argument.push_back(input[position++]);
+  }
+  return true;
+ }
+ bool quoted = false;
+ while (position < input.size())
+ {
+  const unsigned char value = static_cast<unsigned char>(input[position]);
+  if (IsCommandLineLeadByte(value))
+  {
+   if (position + 1 >= input.size()) { argument.push_back(input[position++]); continue; }
+   argument.push_back(input[position++]);
+   argument.push_back(input[position++]);
+   continue;
+  }
+  if (IsCommandLineSpace(value) && !quoted) break;
+  if (value == '\\')
+  {
+   size_t slashEnd = position;
+   while (slashEnd < input.size() && input[slashEnd] == '\\') ++slashEnd;
+   const size_t slashCount = slashEnd - position;
+   if (slashEnd < input.size() && input[slashEnd] == '"')
+   {
+    argument.append(slashCount / 2, '\\');
+    if (slashCount % 2)
+    {
+     argument.push_back('"');
+     position = slashEnd + 1;
+    }
+    else if (quoted && slashEnd + 1 < input.size() && input[slashEnd + 1] == '"')
+    {
+     // The Microsoft CRT treats a doubled quote inside a quoted argument as
+     // one literal quote. Preserve it in the decoded spelling for alias match.
+     argument.push_back('"');
+     position = slashEnd + 2;
+    }
+    else
+    {
+     quoted = !quoted;
+     position = slashEnd + 1;
+    }
+   }
+   else
+   {
+    argument.append(slashCount, '\\');
+    position = slashEnd;
+   }
+   continue;
+  }
+  if (value == '"')
+  {
+   if (quoted && position + 1 < input.size() && input[position + 1] == '"')
+   {
+    argument.push_back('"');
+    position += 2;
+   }
+   else
+   {
+    quoted = !quoted;
+    ++position;
+   }
+   continue;
+  }
+  argument.push_back(input[position++]);
+ }
+ return true;
+}
+
+bool AppendAnsiRange(const std::string& input, size_t start, size_t length, std::wstring& output)
+{
+ if (!length) return true;
+ std::string bytes = input.substr(start, length);
+ std::wstring wide;
+ if (!AnsiToProcessWide(bytes.c_str(), wide)) return false;
+ output.append(wide);
+ return true;
+}
+
+std::wstring QuoteProcessArgument(const std::wstring& argument)
+{
+ std::wstring quoted(1, L'"');
+ size_t slashes = 0;
+ for (wchar_t value : argument)
+ {
+  if (value == L'\\') { ++slashes; continue; }
+  if (value == L'"')
+  {
+   quoted.append(slashes * 2 + 1, L'\\');
+   quoted.push_back(value);
+  }
+  else
+  {
+   quoted.append(slashes, L'\\');
+   quoted.push_back(value);
+  }
+  slashes = 0;
+ }
+ quoted.append(slashes * 2, L'\\');
+ quoted.push_back(L'"');
+ return quoted;
+}
+
+bool ConvertCommandLineAliases(const std::string& input, std::wstring& output, bool& replaced)
+{
+ output.clear();
+ replaced = false;
+ size_t position = 0, copiedThrough = 0;
+ bool executableName = true;
+ while (position < input.size())
+ {
+  while (position < input.size() && IsCommandLineSpace(static_cast<unsigned char>(input[position]))) ++position;
+  if (position == input.size()) break;
+  const size_t argumentStart = position;
+  std::string argument;
+  if (!DecodeCommandLineArgument(input, position, argument, executableName)) return false;
+  executableName = false;
+  const size_t argumentEnd = position;
+  std::wstring realPath;
+  if (Utility::LookupSyntheticPathAlias(argument, realPath))
+  {
+   if (!AppendAnsiRange(input, copiedThrough, argumentStart - copiedThrough, output)) return false;
+   output += QuoteProcessArgument(realPath);
+   copiedThrough = argumentEnd;
+   replaced = true;
+  }
+  // Leave all untouched arguments byte-for-byte equivalent in the command
+  // line, preserving their original quoting and escaping semantics.
+  while (position < input.size() && IsCommandLineSpace(static_cast<unsigned char>(input[position]))) ++position;
+ }
+ if (!replaced) return true;
+ return AppendAnsiRange(input, copiedThrough, input.size() - copiedThrough, output);
+}
+
 BOOL WINAPI CreateProcessAHook(LPCSTR application, LPSTR command,
  LPSECURITY_ATTRIBUTES processAttributes, LPSECURITY_ATTRIBUTES threadAttributes,
  BOOL inheritHandles, DWORD flags, LPVOID environment, LPCSTR currentDirectory,
@@ -2395,25 +2563,8 @@ BOOL WINAPI CreateProcessAHook(LPCSTR application, LPSTR command,
  {
   std::string input(command);
   std::wstring converted;
-  bool replaced = false, valid = true;
-  size_t pos = 0;
-  while (pos < input.size())
-  {
-   size_t start = pos;
-   bool quoted = input[pos] == '"';
-   if (quoted) ++pos;
-   size_t tokenStart = pos;
-   while (pos < input.size() && (quoted ? input[pos] != '"' : input[pos] != ' ' && input[pos] != '\t')) ++pos;
-   std::string token = input.substr(tokenStart, pos - tokenStart);
-   std::wstring value;
-   if (Utility::LookupSyntheticPathAlias(token, value)) replaced = true;
-   else if (!AnsiToProcessWide(token.c_str(), value)) { valid = false; break; }
-   if (quoted) converted += L'"';
-   converted += value;
-   if (quoted && pos < input.size()) { converted += L'"'; ++pos; }
-   if (pos == start) { converted += static_cast<unsigned char>(input[pos]); ++pos; }
-  }
-  if (replaced && valid)
+  bool replaced = false;
+  if (ConvertCommandLineAliases(input, converted, replaced) && replaced)
   {
    std::wstring app, dir, reserved, desktop, title;
    if (AnsiToProcessWide(application, app) && AnsiToProcessWide(currentDirectory, dir) &&
