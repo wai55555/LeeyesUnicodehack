@@ -6,6 +6,7 @@ namespace LeeyesInternal
 {
 
 void RequestTraceStop();
+bool StopTraceWorkerAndJoin();
 
 }
 

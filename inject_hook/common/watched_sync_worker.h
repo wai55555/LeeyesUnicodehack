@@ -2,8 +2,16 @@
 
 #include "watched_snapshot_process.h"
 #include "watched_sync_coordinator.h"
+#include <Windows.h>
 #include <atomic>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <mutex>
+#include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 // Experimental process-lifetime worker. Start/Stop and destruction must never
 // occur on the UI thread or in DllMain. If a terminated child remains stuck in
@@ -121,7 +129,7 @@ private:
 				if( header.kind == static_cast<DWORD>(WatchedSnapshotStream::Kind::Refresh) )
 				{
 					std::uint64_t ack = 0;
-					if( body.size() == sizeof(ack) ) memcpy(&ack, body.data(), sizeof(ack));
+					if( body.size() == sizeof(ack) ) std::memcpy(&ack, body.data(), sizeof(ack));
 					if( !sentRequest || ack != sentRequest || ack <= acknowledgedRequest )
 					{
 						coordinator_.Disconnected(activeEpoch, ERROR_INVALID_DATA); failedTarget = true;
@@ -132,7 +140,7 @@ private:
 				if( delivery == WatchedSyncCoordinator::Delivery::Accepted )
 				{
 					if( header.kind == static_cast<DWORD>(WatchedSnapshotStream::Kind::Refresh) && body.size() == sizeof(acknowledgedRequest) )
-						memcpy(&acknowledgedRequest, body.data(), sizeof(acknowledgedRequest));
+						std::memcpy(&acknowledgedRequest, body.data(), sizeof(acknowledgedRequest));
 					if( header.kind == static_cast<DWORD>(WatchedSnapshotStream::Kind::Snapshot) ) ++snapshotFrames_;
 					else if( header.kind == static_cast<DWORD>(WatchedSnapshotStream::Kind::Dirty) ) ++dirtyFrames_;
 				}

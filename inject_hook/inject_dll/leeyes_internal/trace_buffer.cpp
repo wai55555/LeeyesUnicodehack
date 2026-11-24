@@ -21,7 +21,8 @@ void AppendPath(char* path, size_t capacity, const char* suffix)
 }
 
 TraceBuffer::TraceBuffer()
-	: next_(0), dropped_(0), wakeEvent_(nullptr), flushThread_(nullptr), stop_(0), flushed_(0)
+	: next_(0), dropped_(0), wakeEvent_(nullptr), flushThread_(nullptr), modulePin_(nullptr),
+	  flushThreadId_(0), stop_(0), flushed_(0)
 {
 	logPath_[0] = '\0';
 	for( DWORD index = 0; index < kTraceCapacity; ++index ) committed_[index].store(0);
@@ -29,22 +30,31 @@ TraceBuffer::TraceBuffer()
 
 bool TraceBuffer::Start(const ResolvedTargets& targets, bool hooksInstalled)
 {
+	std::lock_guard<std::mutex> lock(lifecycleMutex_);
 	if( wakeEvent_ ) return true;
+	HMODULE modulePin = nullptr;
+	if( !::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+		reinterpret_cast<LPCWSTR>(&TraceBuffer::FlushThreadEntry), &modulePin) )
+		return false;
 	char modulePath[MAX_PATH * 2] = {};
 	if( !targets.module || !::GetModuleFileNameA(targets.module, modulePath, _countof(modulePath)) )
-		return false;
+	{ ::FreeLibrary(modulePin); return false; }
 	strncpy_s(logPath_, _countof(logPath_), modulePath, _TRUNCATE);
 	char* dot = strrchr(logPath_, '.');
 	if( dot ) *dot = '\0';
 	AppendPath(logPath_, _countof(logPath_), "_internal_trace.txt");
 	wakeEvent_ = ::CreateEventA(nullptr, FALSE, FALSE, nullptr);
-	if( !wakeEvent_ ) return false;
+	if( !wakeEvent_ ) { ::FreeLibrary(modulePin); return false; }
 	stop_.store(0, std::memory_order_release);
-	flushThread_ = ::CreateThread(nullptr, 0, &TraceBuffer::FlushThreadEntry, this, 0, nullptr);
+	modulePin_ = modulePin;
+	flushThread_ = ::CreateThread(nullptr, 0, &TraceBuffer::FlushThreadEntry, this, 0, &flushThreadId_);
 	if( !flushThread_ )
 	{
+		modulePin_ = nullptr;
+		flushThreadId_ = 0;
 		::CloseHandle(wakeEvent_);
 		wakeEvent_ = nullptr;
+		::FreeLibrary(modulePin);
 		return false;
 	}
 	::SetEvent(wakeEvent_);
@@ -57,6 +67,26 @@ void TraceBuffer::RequestStop()
 	if( !wakeEvent_ ) return;
 	stop_.store(1, std::memory_order_release);
 	::SetEvent(wakeEvent_);
+}
+
+bool TraceBuffer::StopAndJoin()
+{
+	HMODULE modulePin = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(lifecycleMutex_);
+		if( !flushThread_ ) return true;
+		if( ::GetCurrentThreadId() == flushThreadId_ ) return false;
+		RequestStop();
+		if( ::WaitForSingleObject(flushThread_, INFINITE) != WAIT_OBJECT_0 ) return false;
+		::CloseHandle(flushThread_);
+		flushThread_ = nullptr;
+		flushThreadId_ = 0;
+		if( wakeEvent_ ) { ::CloseHandle(wakeEvent_); wakeEvent_ = nullptr; }
+		modulePin = modulePin_;
+		modulePin_ = nullptr;
+	}
+	if( modulePin ) ::FreeLibrary(modulePin);
+	return true;
 }
 
 void TraceBuffer::Append(const TraceRecord& record)

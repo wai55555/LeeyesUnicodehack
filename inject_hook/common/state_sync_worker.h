@@ -2,6 +2,7 @@
 
 #include "state_sync_coordinator.h"
 #include <atomic>
+#include <new>
 #include <thread>
 
 // Explicit-lifetime background reader. Never construct or stop it from
@@ -58,7 +59,16 @@ private:
 	void Run()
 	{
 		try { RunLoop(); }
-		catch( ... ) { failed_.store(true); }
+		catch( const std::bad_alloc& )
+		{
+			lastError_.store(ERROR_NOT_ENOUGH_MEMORY);
+			failed_.store(true);
+		}
+		catch( ... )
+		{
+			lastError_.store(ERROR_GEN_FAILURE);
+			failed_.store(true);
+		}
 	}
 	void RunLoop()
 	{
@@ -70,12 +80,18 @@ private:
 				DirectorySnapshot::State state;
 				SnapshotWire::ProcessResult process;
 				try { process = SnapshotWire::ReadOnWorkerThread(launcher_, work.path, timeoutMs_, state); }
-				catch( ... )
+				catch( const std::bad_alloc& )
 				{
 					// An exception can occur after process creation. We cannot prove
 					// cleanup without a returned handle; disable the worker so its
 					// caller can fall back instead of silently waiting forever.
 					lastError_.store(ERROR_NOT_ENOUGH_MEMORY);
+					failed_.store(true);
+					return;
+				}
+				catch( ... )
+				{
+					lastError_.store(ERROR_GEN_FAILURE);
 					failed_.store(true);
 					return;
 				}

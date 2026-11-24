@@ -13,6 +13,13 @@ struct State { DWORD volume = 0; ULONGLONG directoryId = 0; std::vector<Item> it
 enum class ChangeKind { Added, Removed, Replaced };
 struct Change { ChangeKind kind; size_t before, after; };
 enum class DiffResult { Complete, DifferentDirectory, InvalidState, LimitExceeded };
+enum class ReadResult { Complete, Unavailable, Retry, Failed };
+
+inline bool IsIdentityEvidenceUnavailable(DWORD error)
+{
+	return error == ERROR_ACCESS_DENIED || error == ERROR_NOT_SUPPORTED
+		|| error == ERROR_INVALID_FUNCTION || error == ERROR_PRIVILEGE_NOT_HELD;
+}
 
 inline bool Valid(const State& state)
 {
@@ -69,19 +76,27 @@ inline DiffResult Diff(const State& before, const State& after, size_t maximumCh
 
 // On failure output is untouched. A caller must keep its watcher armed and
 // discard this evidence if the watcher generation changes or overflows.
-inline bool Read(const std::wstring& path, const DirectorySnapshot::State& snapshot,
+inline ReadResult ReadDetailed(const std::wstring& path, const DirectorySnapshot::State& snapshot,
 	State& output, DWORD& error)
 {
 	error = ERROR_SUCCESS;
-	if( path.empty() || !snapshot.directoryId ) { error = ERROR_INVALID_PARAMETER; return false; }
-	if( snapshot.entries.size() > 200000 ) { error = ERROR_BUFFER_OVERFLOW; return false; }
+	if( path.empty() || !snapshot.directoryId ) { error = ERROR_INVALID_PARAMETER; return ReadResult::Failed; }
+	if( snapshot.entries.size() > 200000 ) { error = ERROR_BUFFER_OVERFLOW; return ReadResult::Failed; }
 	try
 	{
 		DirectorySnapshot::Handle root(DirectorySnapshot::OpenDirectory(path));
-		if( root.value == INVALID_HANDLE_VALUE ) { error = ::GetLastError(); return false; }
+		if( root.value == INVALID_HANDLE_VALUE )
+		{
+			error = ::GetLastError();
+			if( error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND )
+				return ReadResult::Retry;
+			return IsIdentityEvidenceUnavailable(error) ? ReadResult::Unavailable : ReadResult::Failed;
+		}
 		DWORD volume = 0; ULONGLONG id = 0, write = 0;
-		if( !DirectorySnapshot::Identity(root.value, volume, id, write, error) ) return false;
-		if( volume != snapshot.volume || id != snapshot.directoryId ) { error = ERROR_RETRY; return false; }
+		if( !DirectorySnapshot::Identity(root.value, volume, id, write, error) )
+			return IsIdentityEvidenceUnavailable(error) ? ReadResult::Unavailable
+				: (error == ERROR_RETRY ? ReadResult::Retry : ReadResult::Failed);
+		if( volume != snapshot.volume || id != snapshot.directoryId ) { error = ERROR_RETRY; return ReadResult::Retry; }
 		State next; next.volume = volume; next.directoryId = id;
 		next.items.reserve(snapshot.entries.size());
 		std::wstring prefix = path;
@@ -92,8 +107,8 @@ inline bool Read(const std::wstring& path, const DirectorySnapshot::State& snaps
 			if( entry.name.empty() || entry.name.size() > 255 || entry.name.find(L'\0') != std::wstring::npos
 				|| entry.name == L"." || entry.name == L".."
 				|| entry.name.find_first_of(L"\\/") != std::wstring::npos
-				|| (i && !(snapshot.entries[i - 1].name < entry.name)) ) { error = ERROR_INVALID_DATA; return false; }
-			if( entry.attributes & FILE_ATTRIBUTE_REPARSE_POINT ) { error = ERROR_NOT_SUPPORTED; return false; }
+				|| (i && !(snapshot.entries[i - 1].name < entry.name)) ) { error = ERROR_INVALID_DATA; return ReadResult::Failed; }
+			if( entry.attributes & FILE_ATTRIBUTE_REPARSE_POINT ) { error = ERROR_NOT_SUPPORTED; return ReadResult::Unavailable; }
 			#ifdef DIRECTORY_ENTRY_IDENTITY_TEST_HOOK
 			DIRECTORY_ENTRY_IDENTITY_TEST_HOOK(path, entry.name);
 			#endif
@@ -106,26 +121,42 @@ inline bool Read(const std::wstring& path, const DirectorySnapshot::State& snaps
 				// A child may disappear between enumeration and opening it during
 				// an ordinary move. The enclosing watcher invalidates old tickets
 				// and checks the target identity before the next attempt.
-				if( error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ) error = ERROR_RETRY;
-				return false;
+				if( error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND )
+				{ error = ERROR_RETRY; return ReadResult::Retry; }
+				return IsIdentityEvidenceUnavailable(error) ? ReadResult::Unavailable
+					: (error == ERROR_RETRY ? ReadResult::Retry : ReadResult::Failed);
 			}
 			BY_HANDLE_FILE_INFORMATION info = {};
-			if( !::GetFileInformationByHandle(item.value, &info) ) { error = ::GetLastError(); return false; }
+			if( !::GetFileInformationByHandle(item.value, &info) )
+			{
+				error = ::GetLastError();
+				return IsIdentityEvidenceUnavailable(error) ? ReadResult::Unavailable
+					: (error == ERROR_RETRY ? ReadResult::Retry : ReadResult::Failed);
+			}
 			if( info.dwFileAttributes != entry.attributes || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
 				|| DirectorySnapshot::Combine(info.nFileSizeHigh, info.nFileSizeLow) != entry.size
 				|| DirectorySnapshot::Combine(info.ftCreationTime.dwHighDateTime, info.ftCreationTime.dwLowDateTime) != entry.created
 				|| DirectorySnapshot::Combine(info.ftLastWriteTime.dwHighDateTime, info.ftLastWriteTime.dwLowDateTime) != entry.written )
-			{ error = ERROR_RETRY; return false; }
+			{ error = ERROR_RETRY; return ReadResult::Retry; }
 			Item identity; identity.name = entry.name; identity.volume = info.dwVolumeSerialNumber;
 			identity.id = DirectorySnapshot::Combine(info.nFileIndexHigh, info.nFileIndexLow);
-			if( !identity.id ) { error = ERROR_NOT_SUPPORTED; return false; }
+			if( !identity.id ) { error = ERROR_NOT_SUPPORTED; return ReadResult::Unavailable; }
 			next.items.push_back(std::move(identity));
 		}
 		DirectorySnapshot::State after;
-		if( !DirectorySnapshot::Read(path, after, error) ) return false;
-		if( !DirectorySnapshot::Same(snapshot, after) ) { error = ERROR_RETRY; return false; }
-		output = std::move(next); return true;
+		if( !DirectorySnapshot::Read(path, after, error) )
+			return error == ERROR_RETRY ? ReadResult::Retry : ReadResult::Failed;
+		if( !DirectorySnapshot::Same(snapshot, after) ) { error = ERROR_RETRY; return ReadResult::Retry; }
+		output = std::move(next); return ReadResult::Complete;
 	}
-	catch( ... ) { error = ERROR_NOT_ENOUGH_MEMORY; return false; }
+	catch( ... ) { error = ERROR_NOT_ENOUGH_MEMORY; return ReadResult::Failed; }
+}
+
+// Preserve the original bool API for diagnostics and callers that only need
+// complete identity evidence. Unavailable evidence remains a failure here.
+inline bool Read(const std::wstring& path, const DirectorySnapshot::State& snapshot,
+	State& output, DWORD& error)
+{
+	return ReadDetailed(path, snapshot, output, error) == ReadResult::Complete;
 }
 }

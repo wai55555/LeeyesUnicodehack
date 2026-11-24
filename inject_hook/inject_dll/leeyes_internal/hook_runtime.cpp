@@ -72,9 +72,28 @@ extern "C" __declspec(dllexport) void WINAPI InitializeLeeyesInternalHooks()
 	StartupDiagnosticLog("internal_init_begin", "resolver pending");
 	const bool traceEnabled = ReadTraceSetting();
 	const bool batchEnabled = ReadInternalSetting("FileMoveBatch", 1) != 0;
+	#if UNICODEHACK_PATH_DEBUG
+	const bool treeTimingEnabled = ReadInternalSetting("TreeTiming", 0) != 0;
+	#else
+	const bool treeTimingEnabled = false;
+	#endif
+	if( !traceEnabled && !batchEnabled && !treeTimingEnabled )
+	{
+		StartupDiagnosticLog("internal_init_complete", "trace=0 batch=0 tree_timing=0");
+		gInitializationState.store(2, std::memory_order_release);
+		return;
+	}
+
+	#if UNICODEHACK_PATH_DEBUG
+	if( treeTimingEnabled )
+	{
+		const bool treeInstalled = InstallTreeTimingHook();
+		StartupDiagnosticLog(treeInstalled ? "tree_timing_installed" : "tree_timing_failed", "diagnostic only");
+	}
+	#endif
 	if( !traceEnabled && !batchEnabled )
 	{
-		StartupDiagnosticLog("internal_init_complete", "trace=0 batch=0");
+		StartupDiagnosticLog("internal_init_complete", "trace=0 batch=0 tree_timing=1");
 		gInitializationState.store(2, std::memory_order_release);
 		return;
 	}
@@ -88,13 +107,6 @@ extern "C" __declspec(dllexport) void WINAPI InitializeLeeyesInternalHooks()
 		return;
 	}
 	bool batchInstalled = false;
-	#if UNICODEHACK_PATH_DEBUG
-	if( ReadInternalSetting("TreeTiming", 0) != 0 )
-	{
-		const bool treeInstalled = InstallTreeTimingHook();
-		StartupDiagnosticLog(treeInstalled ? "tree_timing_installed" : "tree_timing_failed", "diagnostic only");
-	}
-	#endif
 	if( batchEnabled )
 	{
 		DWORD threshold = static_cast<DWORD>(ReadInternalSetting("FileMoveBatchThreshold", 32));
@@ -155,6 +167,11 @@ extern "C" __declspec(dllexport) void WINAPI InitializeLeeyesInternalHooks()
 void RequestTraceStop()
 {
 	GetTraceBuffer().RequestStop();
+}
+
+bool StopTraceWorkerAndJoin()
+{
+	return GetTraceBuffer().StopAndJoin();
 }
 
 }

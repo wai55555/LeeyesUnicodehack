@@ -349,9 +349,9 @@ bool IsBestFitConversion( const std::wstring& wide, const std::string& ansi )
 
 	const char* GetPathDebugLogPath()
 	{
-		static std::string path;
-		if( path.empty() )
+		static const std::string path = []()
 		{
+			std::string result;
 			char modulePath[MAX_PATH] = {};
 			if( gInjectedModule && ::GetModuleFileNameA(gInjectedModule, modulePath, MAX_PATH) )
 			{
@@ -359,20 +359,21 @@ bool IsBestFitConversion( const std::wstring& wide, const std::string& ansi )
 				if( slash )
 				{
 					*(slash + 1) = '\0';
-					path = modulePath;
-					path += "_path_debug.txt";
+					result = modulePath;
+					result += "_path_debug.txt";
 				}
 			}
-			if( path.empty() ) path = "_path_debug.txt";
-		}
+			if( result.empty() ) result = "_path_debug.txt";
+			return result;
+		}();
 		return path.c_str();
 	}
 
 	const char* GetFailureDebugLogPath()
 	{
-		static std::string path;
-		if( path.empty() )
+		static const std::string path = []()
 		{
+			std::string result;
 			char modulePath[MAX_PATH] = {};
 			if( gInjectedModule && ::GetModuleFileNameA(gInjectedModule, modulePath, MAX_PATH) )
 			{
@@ -380,12 +381,13 @@ bool IsBestFitConversion( const std::wstring& wide, const std::string& ansi )
 				if( slash )
 				{
 					*(slash + 1) = '\0';
-					path = modulePath;
-					path += "inject_dll_failure_debug.txt";
+					result = modulePath;
+					result += "inject_dll_failure_debug.txt";
 				}
 			}
-			if( path.empty() ) path = "inject_dll_failure_debug.txt";
-		}
+			if( result.empty() ) result = "inject_dll_failure_debug.txt";
+			return result;
+		}();
 		return path.c_str();
 	}
 
@@ -3571,7 +3573,7 @@ namespace User32
 
 	HWND WINAPI SetActiveWindowBackgroundHook( HWND window )
 	{
-		if( IsBackgroundProcess() && IsMainFormWindow(window) ) return window;
+		if( IsBackgroundProcess() && IsMainFormWindow(window) ) return ::GetActiveWindow();
 		return originalSetActiveWindow ? originalSetActiveWindow(window) : nullptr;
 	}
 
@@ -5241,6 +5243,10 @@ std::atomic<unsigned long long> gImagePictureInfoFailure(0);
 bool gImagePluginSummaryEnabled = false;
 std::atomic<bool> gImagePluginDiagnosticsStop(false);
 HANDLE gImagePluginDiagnosticsThread = nullptr;
+DWORD gImagePluginDiagnosticsThreadId = 0;
+HMODULE gImagePluginDiagnosticsModulePin = nullptr;
+std::mutex gImagePluginDiagnosticsLifecycleMutex;
+bool gImagePluginDiagnosticsShutdownRequested = false;
 
 std::string ImagePluginDiagnosticPath()
 {
@@ -5265,10 +5271,13 @@ unsigned long ImagePluginPathHash( const std::string& path )
 	return hash;
 }
 
+void StartImagePluginDiagnostics();
+
 void RecordImagePluginCall( ImagePluginCallContext* context, const char* api,
 	LPCSTR input, unsigned int flag, int result )
 {
 	if( !context || !api ) return;
+	StartImagePluginDiagnostics();
 	const bool summaryEnabled = gImagePluginSummaryEnabled;
 	if( Utility::gDebugLogEnabled || summaryEnabled )
 	{
@@ -5348,16 +5357,52 @@ DWORD WINAPI ImagePluginDiagnosticsThreadProc( LPVOID )
 
 void StartImagePluginDiagnostics()
 {
-	if( (!Utility::gDebugLogEnabled && !gImagePluginSummaryEnabled)
-		|| gImagePluginDiagnosticsThread ) return;
+	if( !Utility::gDebugLogEnabled && !gImagePluginSummaryEnabled ) return;
+	std::lock_guard<std::mutex> lock(gImagePluginDiagnosticsLifecycleMutex);
+	if( gImagePluginDiagnosticsShutdownRequested || gImagePluginDiagnosticsThread ) return;
+	HMODULE modulePin = nullptr;
+	if( !::GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+		reinterpret_cast<LPCWSTR>(&ImagePluginDiagnosticsThreadProc), &modulePin) ) return;
 	gImagePluginDiagnosticsStop.store(false, std::memory_order_release);
-	gImagePluginDiagnosticsThread = ::CreateThread(nullptr, 0,
-		&ImagePluginDiagnosticsThreadProc, nullptr, 0, nullptr);
+	DWORD threadId = 0;
+	HANDLE thread = ::CreateThread(nullptr, 0,
+		&ImagePluginDiagnosticsThreadProc, nullptr, 0, &threadId);
+	if( !thread ) { ::FreeLibrary(modulePin); return; }
+	gImagePluginDiagnosticsModulePin = modulePin;
+	gImagePluginDiagnosticsThreadId = threadId;
+	gImagePluginDiagnosticsThread = thread;
 }
 
 void StopImagePluginDiagnostics()
 {
 	gImagePluginDiagnosticsStop.store(true, std::memory_order_release);
+}
+
+bool StopImagePluginDiagnosticsAndJoin()
+{
+	HANDLE thread = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(gImagePluginDiagnosticsLifecycleMutex);
+		gImagePluginDiagnosticsShutdownRequested = true;
+		gImagePluginDiagnosticsStop.store(true, std::memory_order_release);
+		thread = gImagePluginDiagnosticsThread;
+		if( thread && ::GetCurrentThreadId() == gImagePluginDiagnosticsThreadId ) return false;
+	}
+	if( thread && ::WaitForSingleObject(thread, INFINITE) != WAIT_OBJECT_0 ) return false;
+	HMODULE modulePin = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(gImagePluginDiagnosticsLifecycleMutex);
+		if( gImagePluginDiagnosticsThread == thread )
+		{
+			if( gImagePluginDiagnosticsThread ) ::CloseHandle(gImagePluginDiagnosticsThread);
+			gImagePluginDiagnosticsThread = nullptr;
+			gImagePluginDiagnosticsThreadId = 0;
+			modulePin = gImagePluginDiagnosticsModulePin;
+			gImagePluginDiagnosticsModulePin = nullptr;
+		}
+	}
+	if( modulePin ) ::FreeLibrary(modulePin);
+	return true;
 }
 
 #endif
@@ -6412,9 +6457,6 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 		}
 		Shell32::hookDragQueryFileW();
 		Shell32::hookDragQueryFileA();
-		#if UNICODEHACK_PLUGIN_DEBUG
-		SusieAM00::StartImagePluginDiagnostics();
-		#endif
 		break;
 	case DLL_THREAD_ATTACH:
 		setlocale(LC_ALL, "Japanese_Japan.932");
@@ -6436,4 +6478,15 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 		break;
 	}
 	return TRUE;
+}
+
+// Call outside DllMain while the caller still holds a module reference. This
+// routine joins diagnostic workers before releasing their pins; any hook
+// teardown required for a full DLL unload remains a separate responsibility.
+extern "C" __declspec(dllexport) BOOL WINAPI ShutdownLeeyesDiagnosticWorkers()
+{
+	#if UNICODEHACK_PLUGIN_DEBUG
+	if( !SusieAM00::StopImagePluginDiagnosticsAndJoin() ) return FALSE;
+	#endif
+	return LeeyesInternal::StopTraceWorkerAndJoin() ? TRUE : FALSE;
 }

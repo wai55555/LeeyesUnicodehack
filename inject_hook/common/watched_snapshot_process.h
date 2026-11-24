@@ -95,6 +95,7 @@ public:
 		error = ERROR_SUCCESS;
 		if( !read_.value || !process_.value ) { error = ERROR_INVALID_HANDLE; return false; }
 		const ULONGLONG started = ::GetTickCount64();
+		bool processExited = false;
 		try
 		{
 			for( ;; )
@@ -122,8 +123,13 @@ public:
 					{ error = ::GetLastError(); if( !error ) error = ERROR_READ_FAULT; return false; }
 					pending_.resize(offset + count); continue;
 				}
+				// The child may have written its final frame after the previous
+				// zero-byte peek and then exited before the process wait below.
+				// Re-peek once after observing exit so buffered pipe data is drained
+				// before EOF is reported.
+				if( processExited ) { error = ERROR_BROKEN_PIPE; return false; }
 				const DWORD wait = ::WaitForSingleObject(process_.value, 0);
-				if( wait == WAIT_OBJECT_0 ) { error = ERROR_BROKEN_PIPE; return false; }
+				if( wait == WAIT_OBJECT_0 ) { processExited = true; continue; }
 				if( wait != WAIT_TIMEOUT ) { error = ::GetLastError(); return false; }
 				if( ::GetTickCount64() - started >= timeoutMs ) { error = ERROR_TIMEOUT; return false; }
 				::Sleep(5);

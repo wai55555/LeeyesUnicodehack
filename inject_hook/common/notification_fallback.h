@@ -148,11 +148,12 @@ public:
 	// Treat allocation failure or non-ASCII bytes as ambiguous.
 	bool HasAmbiguousDirectoryTransitions() const
 	{
-		if( retired_ ) return true;
+		const auto* entries = EntriesForState();
+		if( !entries ) return true;
 		try
 		{
 			std::map<std::string, unsigned> seen;
-			for( const Entry& entry : entries_ )
+			for( const Entry& entry : *entries )
 			{
 				if( entry.action != 3 && entry.action != 5 ) return true;
 				std::string key = entry.first;
@@ -174,11 +175,12 @@ public:
 	bool DirectoryPaths(std::vector<std::string>& paths) const
 	{
 		paths.clear();
-		if( retired_ ) return false;
+		const auto* entries = EntriesForState();
+		if( !entries ) return false;
 		try
 		{
 			std::map<std::string, std::string> seen;
-			for( const Entry& entry : entries_ )
+			for( const Entry& entry : *entries )
 			{
 				if( entry.action != 3 && entry.action != 5 ) return false;
 				std::string key = entry.first;
@@ -204,7 +206,8 @@ public:
 	// identity in case-sensitive directories or across aliases.
 	bool AllDirectoryPathsCovered(const std::vector<std::string>& paths, bool foldAscii932 = false) const
 	{
-		if( retired_ ) return false;
+		const auto* entries = EntriesForState();
+		if( !entries ) return false;
 		try
 		{
 			std::set<std::string> covered;
@@ -214,7 +217,7 @@ public:
 				if( !FoldPath932(path, foldAscii932, key) ) return false;
 				covered.insert(key);
 			}
-			for( const Entry& entry : entries_ )
+			for( const Entry& entry : *entries )
 			{
 				std::string key;
 				if( (entry.action != 3 && entry.action != 5) || !FoldPath932(entry.first, foldAscii932, key)

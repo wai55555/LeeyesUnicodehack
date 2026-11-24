@@ -207,16 +207,17 @@ static std::map<std::wstring, SweepFolderTerminalState> LoadSweepFolderStates(
 		const char* marker;
 		const char* endMarker;
 		SweepFolderTerminalState state;
+		bool requireThumbnailCounters;
 	};
 	static const EventMarker markers[] = {
-		{ " folder_done path=[", "] items=", SweepFolderTerminalState::Done },
-		{ " folder_timeout path=[", NULL, SweepFolderTerminalState::Failed },
-		{ " folder_stalled path=[", NULL, SweepFolderTerminalState::Failed },
-		{ " folder_drop_failed path=[", NULL, SweepFolderTerminalState::Failed },
-		{ " folder_process_exit path=[", NULL, SweepFolderTerminalState::Failed },
-		{ " folder_unprocessed path=[", NULL, SweepFolderTerminalState::Failed },
-		{ " folder_skip_failed path=[", NULL, SweepFolderTerminalState::Failed },
-		{ " folder_skip_completed path=[", NULL, SweepFolderTerminalState::Done }
+		{ " folder_done path=[", "] items=", SweepFolderTerminalState::Done, true },
+		{ " folder_timeout path=[", NULL, SweepFolderTerminalState::Failed, false },
+		{ " folder_stalled path=[", NULL, SweepFolderTerminalState::Failed, false },
+		{ " folder_drop_failed path=[", NULL, SweepFolderTerminalState::Failed, false },
+		{ " folder_process_exit path=[", NULL, SweepFolderTerminalState::Failed, false },
+		{ " folder_unprocessed path=[", NULL, SweepFolderTerminalState::Failed, false },
+		{ " folder_skip_failed path=[", NULL, SweepFolderTerminalState::Failed, false },
+		{ " folder_skip_completed path=[", NULL, SweepFolderTerminalState::Done, false }
 	};
 	std::string line;
 	while( std::getline(input, line) )
@@ -227,7 +228,7 @@ static std::map<std::wstring, SweepFolderTerminalState> LoadSweepFolderStates(
 			if( !DecodeSweepEventPath(line, marker.marker, marker.endMarker, path) )
 				continue;
 			SweepFolderTerminalState state = marker.state;
-			if( state == SweepFolderTerminalState::Done
+			if( marker.requireThumbnailCounters && state == SweepFolderTerminalState::Done
 				&& line.find(" thumbnail_failed=0 thumbnail_unprocessed=0") == std::string::npos )
 				state = SweepFolderTerminalState::Failed;
 			// The append-only log is ordered by the durable event boundary. The
@@ -739,6 +740,9 @@ struct SweepDirectoryInventory
 	bool enumerationComplete = true;
 };
 
+static bool ListViewMatchesInventory(DWORD processId, HWND list, DWORD count,
+	const SweepDirectoryInventory& inventory);
+
 static SweepDirectoryInventory PushSweepChildren(const std::wstring& current,
 	std::vector<std::wstring>& pending, std::set<std::wstring>& visited,
 	SweepLogger* logger)
@@ -837,18 +841,6 @@ static bool SweepWideToUtf8(const std::wstring& value, std::string& output)
 		static_cast<int>(value.size()), &output[0], length, NULL, NULL) == length;
 }
 
-static bool SweepUtf8ToWide(const std::string& value, std::wstring& output)
-{
-	output.clear();
-	if( value.empty() ) return true;
-	const int length = ::MultiByteToWideChar(CP_UTF8, 0, value.data(),
-		static_cast<int>(value.size()), NULL, 0);
-	if( length <= 0 ) return false;
-	output.resize(static_cast<size_t>(length));
-	return ::MultiByteToWideChar(CP_UTF8, 0, value.data(),
-		static_cast<int>(value.size()), &output[0], length) == length;
-}
-
 static bool WriteSweepManifest(const std::wstring& path,
 	const std::wstring& root, const std::vector<std::wstring>& folders,
 	bool coverageComplete, SweepLogger* logger)
@@ -903,87 +895,6 @@ static bool WriteSweepManifest(const std::wstring& path,
 			+ L"] error=" + std::to_wstring(error), true);
 		return false;
 	}
-	return true;
-}
-
-static bool ReadSweepFile(const std::wstring& path, std::string& content)
-{
-	content.clear();
-	HANDLE file = ::CreateFileW(path.c_str(), GENERIC_READ,
-		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
-		FILE_ATTRIBUTE_NORMAL, NULL);
-	if( file == INVALID_HANDLE_VALUE ) return false;
-	LARGE_INTEGER size = {};
-	if( !::GetFileSizeEx(file, &size) || size.QuadPart < 0
-		|| static_cast<unsigned long long>(size.QuadPart) > 512ULL * 1024ULL * 1024ULL )
-	{
-		::CloseHandle(file);
-		return false;
-	}
-	content.resize(static_cast<size_t>(size.QuadPart));
-	size_t offset = 0;
-	while( offset < content.size() )
-	{
-		const DWORD requested = static_cast<DWORD>(std::min<size_t>(
-			content.size() - offset, 1024 * 1024));
-		DWORD read = 0;
-		if( !::ReadFile(file, &content[0] + offset, requested, &read, NULL)
-			|| read != requested )
-		{
-			::CloseHandle(file);
-			content.clear();
-			return false;
-		}
-		offset += read;
-	}
-	::CloseHandle(file);
-	return true;
-}
-
-static bool LoadSweepManifest(const std::wstring& path, const std::wstring& root,
-	std::vector<std::wstring>& folders, bool& coverageComplete, SweepLogger* logger)
-{
-	folders.clear();
-	coverageComplete = false;
-	std::string content;
-	if( !ReadSweepFile(path, content) ) return false;
-	size_t cursor = 0;
-	auto nextLine = [&content, &cursor](std::string& line) -> bool
-	{
-		if( cursor > content.size() ) return false;
-		const size_t end = content.find('\n', cursor);
-		if( end == std::string::npos )
-		{
-			line = content.substr(cursor);
-			cursor = content.size() + 1;
-		}
-		else
-		{
-			line = content.substr(cursor, end - cursor);
-			cursor = end + 1;
-		}
-		if( !line.empty() && line.back() == '\r' ) line.pop_back();
-		return true;
-	};
-	std::string line;
-	if( !nextLine(line) || line.find("LEYEESW_SWEEP_MANIFEST_V1 coverage_complete=") != 0 )
-		return false;
-	coverageComplete = line.find("coverage_complete=1") != std::string::npos;
-	std::string rootLine;
-	if( !nextLine(rootLine) ) return false;
-	std::wstring manifestRoot;
-	if( !SweepUtf8ToWide(rootLine, manifestRoot) || manifestRoot != root ) return false;
-	while( nextLine(line) )
-	{
-		if( line.empty() ) continue;
-		std::wstring folder;
-		if( !SweepUtf8ToWide(line, folder) ) return false;
-		folders.push_back(folder);
-	}
-	if( folders.empty() || folders.front() != root ) return false;
-	if( logger ) logger->Write(L"sweep_manifest_loaded path=[" + path
-		+ L"] folders=" + std::to_wstring(folders.size())
-		+ L" coverage_complete=" + std::to_wstring(coverageComplete ? 1 : 0));
 	return true;
 }
 
@@ -1245,7 +1156,7 @@ static bool ListViewSnapshotChanged(const ListViewSnapshot& before,
 }
 
 static HWND WaitForStableListView(DWORD processId, const ListViewSnapshot& before,
-	unsigned long long expectedFiles, unsigned long long expectedCandidateFiles,
+	const SweepDirectoryInventory& inventory,
 	DWORD minimumWaitMilliseconds,
 	SweepLogger* logger)
 {
@@ -1259,6 +1170,10 @@ static HWND WaitForStableListView(DWORD processId, const ListViewSnapshot& befor
 	DWORD previousCount = 0xFFFFFFFFUL;
 	DWORD stableMilliseconds = 0;
 	HWND lastList = NULL;
+	ListViewSnapshot previousSnapshot = { NULL, 0, std::wstring(), std::string(),
+		std::string(), std::string(), false };
+	ULONGLONG lastInventoryCheck = 0;
+	bool inventoryMismatchLogged = false;
 	// An invalid pre-drop snapshot is not evidence that a transition occurred.
 	// Accepting the first visible ListView in that state can mistake Leeyes'
 	// startup/default folder for the folder just submitted by WM_DROPFILES.
@@ -1342,18 +1257,44 @@ static HWND WaitForStableListView(DWORD processId, const ListViewSnapshot& befor
 			&& ListViewSnapshotChanged(before, current) )
 			transitionObserved = true;
 
-		const bool emptyNoOp = expectedFiles == 0 && before.count == 0 && count == 0;
-		if( (transitionObserved || emptyNoOp) && list && list == lastList
-			&& count == previousCount && !(expectedCandidateFiles != 0 && count == 0) )
+		const bool emptyNoOp = inventory.enumerationComplete
+			&& inventory.files == 0 && inventory.directories == 0
+			&& before.count == 0 && count == 0;
+		const bool sameSnapshot = list && list == lastList && count == previousCount
+			&& current.valid && previousSnapshot.valid
+			&& !ListViewSnapshotChanged(previousSnapshot, current);
+		if( sameSnapshot )
 			stableMilliseconds += 100;
 		else
 			stableMilliseconds = 0;
 		lastList = list;
 		previousCount = count;
+		previousSnapshot = current;
 
-		if( (transitionObserved || emptyNoOp) && list
-			&& GetTickCount64() - started >= minimumWaitMilliseconds
-			&& stableMilliseconds >= 800 ) return list;
+		if( list && GetTickCount64() - started >= minimumWaitMilliseconds
+			&& stableMilliseconds >= 800 )
+		{
+			if( transitionObserved || emptyNoOp ) return list;
+			// Re-opening the already displayed folder may leave the ListView
+			// unchanged. Accept that case only after all displayed names match the
+			// freshly enumerated folder inventory, not from stability alone.
+			if( !lastInventoryCheck || GetTickCount64() - lastInventoryCheck >= 5000 )
+			{
+				lastInventoryCheck = GetTickCount64();
+				if( ListViewMatchesInventory(processId, list, count, inventory) )
+				{
+					if( logger ) logger->Write(L"list_inventory_verified_same_view count="
+						+ std::to_wstring(count));
+					return list;
+				}
+				if( !inventoryMismatchLogged && logger )
+				{
+					logger->Write(L"list_inventory_mismatch_same_view count="
+						+ std::to_wstring(count));
+					inventoryMismatchLogged = true;
+				}
+			}
+		}
 		Sleep(100);
 	}
 	if( logger && !transitionObserved )
@@ -1441,6 +1382,68 @@ static DisplayNameMatchKind EraseDisplayedName(const std::wstring& text,
 	if( found == aliases.end() || found->second.size() != 1 ) return DisplayNameNoMatch;
 	if( expectedNames.erase(*found->second.begin()) == 0 ) return DisplayNameNoMatch;
 	return DisplayNameAlias;
+}
+
+static bool ListViewMatchesInventory(DWORD processId, HWND list, DWORD count,
+	const SweepDirectoryInventory& inventory)
+{
+	if( !inventory.enumerationComplete ) return false;
+	std::set<std::wstring> expectedStorage;
+	const std::set<std::wstring>* expectedNames = nullptr;
+	if( count == inventory.candidateFiles )
+		expectedNames = &inventory.candidateFileNames;
+	else if( count == inventory.candidateFiles + inventory.directories )
+	{
+		expectedStorage = inventory.candidateFileNames;
+		expectedStorage.insert(inventory.directoryNames.begin(), inventory.directoryNames.end());
+		expectedNames = &expectedStorage;
+	}
+	else if( count == inventory.files )
+		expectedNames = &inventory.allFileNames;
+	else if( count == inventory.files + inventory.directories )
+	{
+		expectedStorage = inventory.allFileNames;
+		expectedStorage.insert(inventory.directoryNames.begin(), inventory.directoryNames.end());
+		expectedNames = &expectedStorage;
+	}
+	if( !expectedNames || expectedNames->size() != count ) return false;
+	if( count == 0 ) return true;
+	HANDLE process = ::OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION
+		| PROCESS_VM_READ | PROCESS_VM_WRITE, FALSE, processId);
+	if( !process ) return false;
+	std::set<std::wstring> remaining = *expectedNames;
+	std::map<std::wstring, std::set<std::wstring>> aliases;
+	BuildDisplayNameAliases(remaining, inventory.allFileNames, aliases);
+	bool matches = true;
+	for( DWORD index = 0; index < count; ++index )
+	{
+		std::wstring wideText;
+		DisplayNameMatchKind match = DisplayNameNoMatch;
+		if( ReadListItemTextWide(process, list, index, wideText) )
+			match = EraseDisplayedName(wideText, remaining, aliases);
+		if( match == DisplayNameNoMatch )
+		{
+			std::string ansiText;
+			std::wstring ansiWideText;
+			if( !ReadListItemText(process, list, index, ansiText)
+				|| !DecodeAnsiListText(ansiText, ansiWideText)
+				|| EraseDisplayedName(ansiWideText, remaining, aliases) == DisplayNameNoMatch )
+			{
+				matches = false;
+				break;
+			}
+		}
+	}
+	if( matches ) matches = remaining.empty();
+	if( matches )
+	{
+		LRESULT finalCount = 0;
+		matches = SendWindowMessageWithTimeout(list, LVM_GETITEMCOUNT, 0, 0,
+			2000, finalCount) && finalCount >= 0
+			&& static_cast<DWORD>(finalCount) == count;
+	}
+	::CloseHandle(process);
+	return matches;
 }
 
 static void AuditListItemName(HANDLE process, HWND list, DWORD index,
@@ -1747,15 +1750,14 @@ static int RunBackgroundSweep(DWORD processId, const std::wstring& root,
 	const std::wstring manifestPath = SweepManifestPath(logger);
 	std::vector<std::wstring> manifestFolders;
 	bool manifestCoverageComplete = false;
-	if( !LoadSweepManifest(manifestPath, root, manifestFolders,
+	// Re-enumerate at each sweep start. A persisted traversal cannot include
+	// folders created since it was written; completion records still preserve
+	// per-folder resume without trusting a stale traversal queue.
+	if( !BuildSweepManifest(root, manifestPath, manifestFolders,
 		manifestCoverageComplete, logger) )
 	{
-		if( !BuildSweepManifest(root, manifestPath, manifestFolders,
-			manifestCoverageComplete, logger) )
-		{
-			if( logger ) logger->Write(L"sweep_manifest_failed path=[" + manifestPath + L"]", true);
-			return 1;
-		}
+		if( logger ) logger->Write(L"sweep_manifest_failed path=[" + manifestPath + L"]", true);
+		return 1;
 	}
 	const std::set<std::wstring> completedFolders = skipCompleted && logger
 		? LoadCompletedSweepFolders(logger->Path()) : std::set<std::wstring>();
@@ -1827,8 +1829,7 @@ static int RunBackgroundSweep(DWORD processId, const std::wstring& root,
 			+ L"] target="
 			+ std::to_wstring(reinterpret_cast<uintptr_t>(dropTarget))
 			+ L" delivery=" + (synchronousDrop ? L"send_timeout" : L"post"), true);
-		HWND list = WaitForStableListView(processId, before, inventory.files,
-			inventory.candidateFiles, 500, logger);
+		HWND list = WaitForStableListView(processId, before, inventory, 500, logger);
 		if( !list )
 		{
 			if( attempt < maxFolderAttempts )

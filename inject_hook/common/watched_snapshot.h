@@ -66,16 +66,51 @@ public:
 		}
 		if( !watcher_.Matches(state) ) { lastReadStage_ = 4; healthy_ = false; error = ERROR_RETRY; return false; }
 		DirectoryEntryIdentity::State identities;
-		if( collectEntryIdentities_ && !DirectoryEntryIdentity::Read(path_, state, identities, error) )
+		bool hasEntryIdentities = false;
+		if( collectEntryIdentities_ )
 		{
-			lastReadStage_ = 7;
-			if( error == ERROR_RETRY )
+			const DirectoryEntryIdentity::ReadResult identityResult =
+				DirectoryEntryIdentity::ReadDetailed(path_, state, identities, error);
+			if( identityResult == DirectoryEntryIdentity::ReadResult::Complete )
+				hasEntryIdentities = true;
+			else if( identityResult == DirectoryEntryIdentity::ReadResult::Unavailable )
 			{
-				DWORD bumpError = ERROR_SUCCESS;
-				if( !Bump(bumpError) ) { healthy_ = false; error = bumpError; }
+				// The filename snapshot is still complete, but this filesystem
+				// cannot provide safe per-entry identity evidence (for example a
+				// reparse point or an unreadable item). Do not omit that item and
+				// pretend the identity set is complete: downgrade this candidate to
+				// snapshot-only after proving the directory listing did not change.
+				lastReadStage_ = 7;
+				DirectorySnapshot::State after;
+				if( !DirectorySnapshot::Read(path_, after, error) )
+				{
+					if( error == ERROR_RETRY )
+					{
+						DWORD bumpError = ERROR_SUCCESS;
+						if( !Bump(bumpError) ) { healthy_ = false; error = bumpError; }
+					}
+					else healthy_ = false;
+					return false;
+				}
+				if( !DirectorySnapshot::Same(state, after) )
+				{
+					DWORD bumpError = ERROR_SUCCESS;
+					if( !Bump(bumpError) ) { healthy_ = false; error = bumpError; }
+					else error = ERROR_RETRY;
+					return false;
+				}
 			}
-			else healthy_ = false;
-			return false;
+			else
+			{
+				lastReadStage_ = 7;
+				if( identityResult == DirectoryEntryIdentity::ReadResult::Retry )
+				{
+					DWORD bumpError = ERROR_SUCCESS;
+					if( !Bump(bumpError) ) { healthy_ = false; error = bumpError; }
+				}
+				else healthy_ = false;
+				return false;
+			}
 		}
 		#ifdef WATCHED_SNAPSHOT_TEST_HOOK
 		WATCHED_SNAPSHOT_TEST_HOOK(path_);
@@ -83,7 +118,7 @@ public:
 		if( !Poll(0, changed, error) ) { lastReadStage_ = 5; return false; }
 		if( changed ) { lastReadStage_ = 6; error = ERROR_RETRY; return false; }
 		Candidate candidate; candidate.generation = generation_; candidate.state = std::move(state);
-		candidate.hasEntryIdentities = collectEntryIdentities_; candidate.entryIdentities = std::move(identities);
+		candidate.hasEntryIdentities = hasEntryIdentities; candidate.entryIdentities = std::move(identities);
 		output = std::move(candidate); error = ERROR_SUCCESS; return true;
 	}
 	bool IsCurrent(const Candidate& candidate) const

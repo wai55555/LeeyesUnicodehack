@@ -17,7 +17,7 @@ Win32/
 *.exp
 *.lib.recipe
 .vs/
-tools/
+/tools/
 
 # Anything actually deployed alongside the real (proprietary) Leeyes binary
 # is a local staging copy, not source - never commit it from here.
@@ -25,7 +25,7 @@ tools/
 /Leeyes_debug/*
 /test*/
 /test_img/*
-reverse/
+/reverse/
 inject_hook/inject_dll/Leeyes_debug/
 inject_hook/injector/Leeyes_debug/
 inject_hook/Leeyes_debug/
