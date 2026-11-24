@@ -13,5 +13,8 @@ bool InstallPassThroughHooks(const ResolvedTargets& targets);
 void RemovePassThroughHooks();
 bool InstallFileMoveBatchHooks(const ResolvedTargets& targets);
 void RemoveFileMoveBatchHooks();
+#if UNICODEHACK_PATH_DEBUG
+bool InstallTreeTimingHook();
+#endif
 
 }

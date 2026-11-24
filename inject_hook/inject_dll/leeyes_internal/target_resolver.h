@@ -17,7 +17,8 @@ enum class TargetKind : DWORD
 	LayoutUpdate = 7,
 	FileChangeDispatch = 8,
 	FullResync = 9,
-	ChangeQueueDrain = 10
+	ChangeQueueDrain = 10,
+	LowItemLookup = 11
 };
 
 struct ResolvedTargets
@@ -35,6 +36,7 @@ struct ResolvedTargets
 	void* fileChangeDispatch = nullptr;
 	void* fullResync = nullptr;
 	void* changeQueueDrain = nullptr;
+	void* lowItemLookup = nullptr;
 	bool changeCallsRefresh = false;
 	char failure[128] = {};
 };

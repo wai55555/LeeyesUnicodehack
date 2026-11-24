@@ -9,7 +9,8 @@ void ConfigureFileMoveBatch(DWORD threshold, bool diagnosticLog);
 void ResetFileMoveBatchState();
 
 extern "C" BOOL __cdecl LeeyesInternalShouldDeferFileChange(
-	void* listView, DWORD rawAction, void* returnAddress);
+	void* dispatchOwner, DWORD rawAction, DWORD path0, DWORD path1,
+	void* returnAddress);
 extern "C" void __cdecl LeeyesInternalBeginChangeQueueDrain(void* notifier);
 extern "C" void __cdecl LeeyesInternalEndChangeQueueDrain();
 

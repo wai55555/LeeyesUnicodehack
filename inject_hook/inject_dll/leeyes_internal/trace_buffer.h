@@ -5,6 +5,7 @@
 #include <Windows.h>
 #include <atomic>
 #include <cstdio>
+#include <mutex>
 
 namespace LeeyesInternal
 {
@@ -37,6 +38,7 @@ public:
 	TraceBuffer();
 	bool Start(const ResolvedTargets& targets, bool hooksInstalled);
 	void RequestStop();
+	bool StopAndJoin();
 	void Append(const TraceRecord& record);
 
 private:
@@ -51,6 +53,9 @@ private:
 	TraceRecord records_[kTraceCapacity];
 	HANDLE wakeEvent_;
 	HANDLE flushThread_;
+	HMODULE modulePin_;
+	DWORD flushThreadId_;
+	std::mutex lifecycleMutex_;
 	std::atomic<LONG> stop_;
 	DWORD flushed_;
 	char logPath_[MAX_PATH * 2];

@@ -55,10 +55,12 @@
       <Optimization>Disabled</Optimization>
       <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>/source-charset:utf-8 %(AdditionalOptions)</AdditionalOptions>
-      <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;_USRDLL;INJECT_TEST_EXPORTS;UNICODEHACK_PATH_DEBUG=1;UNICODEHACK_PLUGIN_DEBUG=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- Diagnostics are enabled explicitly below; avoid _DEBUG so the DLL does not depend on the Debug CRT/STL. -->
+      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_USRDLL;INJECT_TEST_EXPORTS;UNICODEHACK_PATH_DEBUG=1;UNICODEHACK_PLUGIN_DEBUG=1;UNICODEHACK_STARTUP_DIAGNOSTICS=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <MinimalRebuild>true</MinimalRebuild>
       <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
-      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <!-- Keep diagnostic macros without requiring the Debug CRT in the legacy Leeyes process. -->
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <PrecompiledHeader />
       <WarningLevel>Level3</WarningLevel>
       <DebugInformationFormat>EditAndContinue</DebugInformationFormat>
@@ -82,7 +84,7 @@
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>/source-charset:utf-8 %(AdditionalOptions)</AdditionalOptions>
-      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_USRDLL;INJECT_TEST_EXPORTS;UNICODEHACK_PATH_DEBUG=0;UNICODEHACK_PLUGIN_DEBUG=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_USRDLL;INJECT_TEST_EXPORTS;UNICODEHACK_PATH_DEBUG=0;UNICODEHACK_PLUGIN_DEBUG=0;UNICODEHACK_STARTUP_DIAGNOSTICS=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <PrecompiledHeader />
@@ -132,6 +134,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="stdafx.h" />
+    <ClInclude Include="..\common\ansi_path_conversion.h" />
     <ClInclude Include="targetver.h" />
     <ClInclude Include="..\NCodeHook\NCodeHook.h" />
     <ClInclude Include="..\NCodeHook\NCodeHookInstantiation.h" />

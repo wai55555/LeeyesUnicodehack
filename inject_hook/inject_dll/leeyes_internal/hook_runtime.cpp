@@ -61,15 +61,39 @@ bool ReadLayoutTraceSetting()
 
 }
 
+extern "C" void StartupDiagnosticLog(const char* stage, const char* detail);
+
 extern "C" __declspec(dllexport) void WINAPI InitializeLeeyesInternalHooks()
 {
 	LONG expected = 0;
 	if( ::InterlockedCompareExchange(reinterpret_cast<LONG*>(&gInitializationState), 1, expected) != expected )
 		return;
+	StartupDiagnosticLog("dll_attach_complete", "API hooks installed");
+	StartupDiagnosticLog("internal_init_begin", "resolver pending");
 	const bool traceEnabled = ReadTraceSetting();
 	const bool batchEnabled = ReadInternalSetting("FileMoveBatch", 1) != 0;
+	#if UNICODEHACK_PATH_DEBUG
+	const bool treeTimingEnabled = ReadInternalSetting("TreeTiming", 0) != 0;
+	#else
+	const bool treeTimingEnabled = false;
+	#endif
+	if( !traceEnabled && !batchEnabled && !treeTimingEnabled )
+	{
+		StartupDiagnosticLog("internal_init_complete", "trace=0 batch=0 tree_timing=0");
+		gInitializationState.store(2, std::memory_order_release);
+		return;
+	}
+
+	#if UNICODEHACK_PATH_DEBUG
+	if( treeTimingEnabled )
+	{
+		const bool treeInstalled = InstallTreeTimingHook();
+		StartupDiagnosticLog(treeInstalled ? "tree_timing_installed" : "tree_timing_failed", "diagnostic only");
+	}
+	#endif
 	if( !traceEnabled && !batchEnabled )
 	{
+		StartupDiagnosticLog("internal_init_complete", "trace=0 batch=0 tree_timing=1");
 		gInitializationState.store(2, std::memory_order_release);
 		return;
 	}
@@ -77,6 +101,7 @@ extern "C" __declspec(dllexport) void WINAPI InitializeLeeyesInternalHooks()
 	ResolvedTargets targets;
 	if( !ResolveTargets(targets, traceEnabled, batchEnabled) )
 	{
+		StartupDiagnosticLog("resolver_failed", targets.failure);
 		if( traceEnabled ) WriteInitializationStatus("resolver_failed", targets.failure);
 		gInitializationState.store(3, std::memory_order_release);
 		return;
@@ -90,9 +115,11 @@ extern "C" __declspec(dllexport) void WINAPI InitializeLeeyesInternalHooks()
 		if( InstallFileMoveBatchHooks(targets) )
 		{
 			batchInstalled = true;
+			StartupDiagnosticLog("batch_hooks_installed", "file change hooks active");
 		}
 		else
 		{
+			StartupDiagnosticLog("batch_hook_failed", "hooks removed");
 			RemoveFileMoveBatchHooks();
 			ResetFileMoveBatchState();
 			if( !traceEnabled )
@@ -104,6 +131,7 @@ extern "C" __declspec(dllexport) void WINAPI InitializeLeeyesInternalHooks()
 	}
 	if( !traceEnabled )
 	{
+		StartupDiagnosticLog("internal_init_complete", batchInstalled ? "batch=1" : "batch=0");
 		gInitializationState.store(batchInstalled ? 7 : 4, std::memory_order_release);
 		return;
 	}
@@ -117,6 +145,7 @@ extern "C" __declspec(dllexport) void WINAPI InitializeLeeyesInternalHooks()
 	}
 	if( !InstallPassThroughHooks(targets) )
 	{
+		StartupDiagnosticLog("trace_hook_failed", "pass-through hooks removed");
 		WriteInitializationStatus("hook_install_failed", "pass-through hook creation failed");
 		RemovePassThroughHooks();
 		gInitializationState.store(batchInstalled ? 7 : 4, std::memory_order_release);
@@ -124,18 +153,25 @@ extern "C" __declspec(dllexport) void WINAPI InitializeLeeyesInternalHooks()
 	}
 	if( !GetTraceBuffer().Start(targets, true) )
 	{
+		StartupDiagnosticLog("trace_start_failed", "trace buffer stopped");
 		WriteInitializationStatus("trace_start_failed", "fixed trace buffer worker could not start");
 		RemovePassThroughHooks();
 		gInitializationState.store(batchInstalled ? 7 : 5, std::memory_order_release);
 		return;
 	}
 	WriteInitializationStatus("hooks_started", "pass-through trace active");
+	StartupDiagnosticLog("internal_init_complete", "trace=1");
 	gInitializationState.store(6, std::memory_order_release);
 }
 
 void RequestTraceStop()
 {
 	GetTraceBuffer().RequestStop();
+}
+
+bool StopTraceWorkerAndJoin()
+{
+	return GetTraceBuffer().StopAndJoin();
 }
 
 }
