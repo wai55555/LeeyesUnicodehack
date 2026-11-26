@@ -18,3 +18,6 @@ bool InstallTreeTimingHook();
 #endif
 
 }
+
+extern "C" void __cdecl LeeyesInternalInvokeFullResync(void* listView);
+extern "C" BOOL __cdecl LeeyesInternalInvokeResync(void* listView, BOOL incremental);

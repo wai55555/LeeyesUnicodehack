@@ -83,7 +83,8 @@ private:
 	{
 		std::uint64_t activeEpoch = 0, sentRequest = 0, acknowledgedRequest = 0;
 		bool active = false, failedTarget = false;
-		ULONGLONG lastFrame = 0, retryAt = 0;
+		ULONGLONG lastFrame = 0, retryAt = 0, requestStarted = 0;
+		const ULONGLONG requestDeadlineMs = 30000; // Bound a refresh even if live frames keep arriving.
 		while( !stopped_.load() )
 		{
 			std::wstring path; std::uint64_t epoch = 0, request = 0;
@@ -93,6 +94,7 @@ private:
 				// Stop is idempotent and retains an unconfirmed process handle.
 				if( !process.Stop(0) ) { ::Sleep(50); continue; }
 				active = false; failedTarget = false; activeEpoch = epoch; sentRequest = acknowledgedRequest = 0;
+				requestStarted = 0;
 				if( !path.empty() )
 				{
 					DWORD error = ERROR_SUCCESS;
@@ -112,15 +114,24 @@ private:
 				}
 			}
 			if( !active || failedTarget ) { ::Sleep(50); continue; }
+			const ULONGLONG now = ::GetTickCount64();
+			if( requestStarted && now - requestStarted >= requestDeadlineMs )
+			{
+				coordinator_.Disconnected(activeEpoch, ERROR_TIMEOUT);
+				failedTarget = true; active = false; requestStarted = 0;
+				retryAt = now + 1000; process.Stop(0); continue;
+			}
 			if( request && request != sentRequest && sentRequest == acknowledgedRequest )
 			{
 				DWORD sendError = ERROR_SUCCESS;
+				const ULONGLONG started = ::GetTickCount64();
 				if( !process.RequestRefresh(request, sendError) )
 				{
 					coordinator_.Disconnected(activeEpoch, sendError); failedTarget = true;
 					active = false; retryAt = ::GetTickCount64() + 1000; process.Stop(0); continue;
 				}
 				sentRequest = request;
+				requestStarted = started;
 			}
 			WatchedSnapshotStream::Header header = {}; std::vector<BYTE> body; DWORD error = ERROR_SUCCESS;
 			if( process.Next(100, header, body, error) )
@@ -141,7 +152,11 @@ private:
 				{
 					if( header.kind == static_cast<DWORD>(WatchedSnapshotStream::Kind::Refresh) && body.size() == sizeof(acknowledgedRequest) )
 						std::memcpy(&acknowledgedRequest, body.data(), sizeof(acknowledgedRequest));
-					if( header.kind == static_cast<DWORD>(WatchedSnapshotStream::Kind::Snapshot) ) ++snapshotFrames_;
+					if( header.kind == static_cast<DWORD>(WatchedSnapshotStream::Kind::Snapshot) )
+					{
+						++snapshotFrames_;
+						if( sentRequest && acknowledgedRequest == sentRequest ) requestStarted = 0;
+					}
 					else if( header.kind == static_cast<DWORD>(WatchedSnapshotStream::Kind::Dirty) ) ++dirtyFrames_;
 				}
 				if( delivery == WatchedSyncCoordinator::Delivery::Failed )

@@ -72,6 +72,8 @@ extern "C" __declspec(dllexport) void WINAPI InitializeLeeyesInternalHooks()
 	StartupDiagnosticLog("internal_init_begin", "resolver pending");
 	const bool traceEnabled = ReadTraceSetting();
 	const bool batchEnabled = ReadInternalSetting("FileMoveBatch", 1) != 0;
+	const bool listDeleteBatchEnabled = batchEnabled
+		&& ReadInternalSetting("FileMoveDeleteBatch", 0) != 0;
 	#if UNICODEHACK_PATH_DEBUG
 	const bool treeTimingEnabled = ReadInternalSetting("TreeTiming", 0) != 0;
 	#else
@@ -112,6 +114,7 @@ extern "C" __declspec(dllexport) void WINAPI InitializeLeeyesInternalHooks()
 		DWORD threshold = static_cast<DWORD>(ReadInternalSetting("FileMoveBatchThreshold", 32));
 		bool diagnosticLog = ReadInternalSetting("FileMoveBatchLog", 0) != 0;
 		ConfigureFileMoveBatch(threshold, diagnosticLog);
+		ConfigureListDeleteBatch(listDeleteBatchEnabled);
 		if( InstallFileMoveBatchHooks(targets) )
 		{
 			batchInstalled = true;
