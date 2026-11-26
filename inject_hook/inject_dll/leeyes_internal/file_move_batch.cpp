@@ -83,6 +83,10 @@ struct DrainState
 	DWORD unknownScopeChanges;
 	DWORD ownerProbeAttempts;
 	DWORD sampledChanges;
+	bool onlyFileAdds;
+	bool onlyFileDeletes;
+	bool sawFileAdd;
+	bool sawFileDelete;
 	void* currentOwner;
 	HWND currentListWindow;
 	bool currentDirectoryKnown;
@@ -105,7 +109,13 @@ struct DrainState
 DWORD gBatchThreshold = 32;
 bool gDiagnosticLog = false;
 bool gListDeleteBatchEnabled = false;
+bool gListAddSortBatchEnabled = false;
 __declspec(thread) DrainState gDrainState = {};
+
+bool IsListStateBatchEnabled()
+{
+	return gListDeleteBatchEnabled || gListAddSortBatchEnabled;
+}
 
 struct ListWindowSearch
 {
@@ -137,7 +147,8 @@ struct ListSelectionSnapshot
 };
 
 void ObserveListDeleteBatch(void* owner, HWND window, const char* directory);
-bool DeferListDeleteBatchResync(void* owner, HWND window, const char* directory);
+bool DeferListDeleteBatchResync(void* owner, HWND window, const char* directory,
+	bool onlyFileAdds, bool onlyFileDeletes);
 void CompleteListDeleteBatchLegacyResync(void* owner, HWND window, const char* directory, bool legacyResynced);
 LRESULT CALLBACK ListDeleteBatchSubclass(HWND window, UINT message, WPARAM wParam, LPARAM lParam,
 	UINT_PTR subclassId, DWORD_PTR referenceData);
@@ -2498,6 +2509,11 @@ DWORD RestoreListSelection(const ListSelectionSnapshot& snapshot, bool preserveO
 	int focusedIndex = -1;
 	const int itemCount = static_cast<int>(::SendMessageA(
 		snapshot.window, LVM_GETITEMCOUNT, 0, 0));
+	LVITEMA clearSelection = {};
+	clearSelection.stateMask = LVIS_SELECTED;
+	clearSelection.state = 0;
+	::SendMessageA(snapshot.window, LVM_SETITEMSTATE, static_cast<WPARAM>(-1),
+		reinterpret_cast<LPARAM>(&clearSelection));
 	int topIndex = itemCount > 0 && snapshot.originalTopIndex >= 0
 		? (snapshot.originalTopIndex < itemCount ? snapshot.originalTopIndex : itemCount - 1)
 		: -1;
@@ -2602,6 +2618,8 @@ struct ListDeleteBatchState
 	std::unique_ptr<WatchedSyncWorker::Candidate> candidate;
 	bool pendingApply = false;
 	bool bootstrapPending = false;
+	bool pendingOnlyFileAdds = false;
+	bool pendingOnlyFileDeletes = false;
 	bool requestNeeded = false;
 	bool requestOutstanding = false;
 	bool subclassAttached = false;
@@ -2633,6 +2651,147 @@ bool OnlyRegularFilesRemoved(const DirectorySnapshot::State& before, const Direc
 	return true;
 }
 
+// The addition-sort fixture was checked at 2,000 entries. Keep larger lists
+// on Leeyes' ordinary full resync path until they have separate UI-latency data.
+const size_t kMaximumIncrementalSortEntries = 2000;
+
+bool IsArchiveLikeName(const std::wstring& name)
+{
+	const size_t dot = name.find_last_of(L'.');
+	if( dot == std::wstring::npos ) return false;
+	static const wchar_t* extensions[] = {
+		L".zip", L".cbz", L".7z", L".rar", L".cbr", L".lzh", L".lha", L".cab",
+		L".arj", L".tar", L".gz", L".tgz", L".bz2", L".xz", L".pdf"
+	};
+	const wchar_t* extension = name.c_str() + dot;
+	for( const wchar_t* candidate : extensions )
+		if( ::lstrcmpiW(extension, candidate) == 0 ) return true;
+	return false;
+}
+
+bool OnlyRegularFilesAdded(const DirectorySnapshot::State& before, const DirectorySnapshot::State& after)
+{
+	// Reversing the states asks whether the old state is unchanged after
+	// removing only entries from the current state.
+	if( !DirectorySnapshot::OnlyRemovals(after, before) ) return false;
+	size_t i = 0;
+	for( const DirectorySnapshot::Entry& current : after.entries )
+	{
+		while( i < before.entries.size() && before.entries[i].name < current.name ) ++i;
+		if( i < before.entries.size() && before.entries[i].name == current.name ) { ++i; continue; }
+		if( current.attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
+			|| IsArchiveLikeName(current.name) ) return false;
+	}
+	return true;
+}
+
+typedef int (WINAPI *ListNaturalCompare)(PCWSTR, PCWSTR);
+struct ListNaturalLess
+{
+	ListNaturalCompare compare;
+	bool operator()(const std::wstring& a, const std::wstring& b) const
+	{ return compare(a.c_str(), b.c_str()) < 0; }
+};
+struct ListCaseLess
+{
+	bool operator()(const std::wstring& a, const std::wstring& b) const
+	{ return ::lstrcmpiW(a.c_str(), b.c_str()) < 0; }
+};
+
+bool ListSortKeysUnique(const DirectorySnapshot::State& state, int sortIndex)
+{
+	if( state.entries.size() > kMaximumIncrementalSortEntries
+		|| (sortIndex != 0 && sortIndex != 1 && sortIndex != 3) ) return false;
+	try
+	{
+		std::set<ULONGLONG> numeric;
+		HMODULE shlwapi = ::GetModuleHandleW(L"shlwapi.dll");
+		ListNaturalCompare compare = shlwapi
+			? reinterpret_cast<ListNaturalCompare>(::GetProcAddress(shlwapi, "StrCmpLogicalW")) : nullptr;
+		if( sortIndex == 0 && !compare ) return false;
+		std::set<std::wstring, ListNaturalLess> natural(ListNaturalLess{ compare });
+		std::set<std::wstring, ListCaseLess> insensitive;
+		for( const DirectorySnapshot::Entry& entry : state.entries )
+		{
+			if( entry.attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
+				|| IsArchiveLikeName(entry.name) ) return false;
+			if( sortIndex == 0 )
+			{
+				// Leeyes' ANSI comparator has only been checked against the
+				// natural and case-insensitive relations for portable ASCII names.
+				for( wchar_t c : entry.name ) if( c > 0x7f ) return false;
+				if( !natural.insert(entry.name).second || !insensitive.insert(entry.name).second ) return false;
+			}
+			else
+			{
+				const ULONGLONG key = sortIndex == 1 ? entry.size : entry.written;
+				if( !numeric.insert(key).second ) return false;
+			}
+		}
+		if( sortIndex == 3 && numeric.size() > 1 )
+		{
+			// Stay clear of coarse timestamp boundaries and ties.
+			auto previous = numeric.begin();
+			for( auto current = std::next(previous); current != numeric.end(); ++current, ++previous )
+				if( *current - *previous < 20000000ULL ) return false;
+		}
+		return true;
+	}
+	catch( ... ) { return false; }
+}
+
+bool ResolveLeeyesListSort(void* owner, HWND window, const DirectorySnapshot::State* state,
+	BYTE*& sort, int& sortIndex)
+{
+	if( !state || !owner || !window || !::IsWindow(window)
+		|| !DispatchOwnerContainsListWindow(owner, window) ) return false;
+	BYTE* image = reinterpret_cast<BYTE*>(::GetModuleHandleW(nullptr));
+	if( reinterpret_cast<ULONG_PTR>(image) != 0x00400000 ) return false;
+	const BYTE signature[] = { 0x55,0x8b,0xec,0x83,0xc4,0xf8,0x89,0x45,0xf8,
+		0x8b,0x45,0xf8,0x8b,0x80,0x84,0x03,0x00,0x00,0x85,0xc0,0x7c,0x47 };
+	sort = image + 0x000d6f04;
+	if( !IsReadableRange(sort, sizeof(signature)) || memcmp(sort, signature, sizeof(signature)) != 0 ) return false;
+	__try
+	{
+		BYTE* object = static_cast<BYTE*>(owner);
+		if( !IsReadableRange(object + 0x384, sizeof(DWORD))
+			|| !IsReadableRange(object + 0x404, sizeof(DWORD)) ) return false;
+		sortIndex = *reinterpret_cast<const int*>(object + 0x384);
+		if( !ListSortKeysUnique(*state, sortIndex) ) return false;
+		const BYTE* items = *reinterpret_cast<BYTE* const*>(object + 0x404);
+		if( !IsReadableRange(items, 12) ) return false;
+		const int internalCount = *reinterpret_cast<const int*>(items + 8);
+		const int listCount = static_cast<int>(::SendMessageW(window, LVM_GETITEMCOUNT, 0, 0));
+		return internalCount >= 0 && internalCount == listCount;
+	}
+	__except( EXCEPTION_EXECUTE_HANDLER ) { return false; }
+}
+
+bool CanInvokeLeeyesListSort(void* owner, HWND window, const DirectorySnapshot::State* state)
+{
+	BYTE* sort = nullptr;
+	int sortIndex = -1;
+	return ResolveLeeyesListSort(owner, window, state, sort, sortIndex);
+}
+
+bool InvokeLeeyesListSort(void* owner, HWND window, const DirectorySnapshot::State* state)
+{
+	BYTE* sort = nullptr;
+	int sortIndex = -1;
+	if( !ResolveLeeyesListSort(owner, window, state, sort, sortIndex) ) return false;
+	__try
+	{
+		__asm {
+			mov eax, owner
+			call sort
+		}
+	}
+	__except( EXCEPTION_EXECUTE_HANDLER ) { return false; }
+	const int listCount = static_cast<int>(::SendMessageW(window, LVM_GETITEMCOUNT, 0, 0));
+	if( listCount > 0 ) ::SendMessageW(window, LVM_REDRAWITEMS, 0, listCount - 1);
+	return true;
+}
+
 bool ExactAnsiDirectoryToWide(const char* source, std::wstring& destination)
 {
 	if( !source || !*source ) return false;
@@ -2659,7 +2818,7 @@ bool ExactAnsiDirectoryToWide(const char* source, std::wstring& destination)
 
 bool EnsureListDeleteWorker(HWND window, void* owner, const char* directory)
 {
-	if( !gListDeleteBatchEnabled || !window || !owner || !directory
+	if( !IsListStateBatchEnabled() || !window || !owner || !directory
 		|| !::IsWindow(window) || !DispatchOwnerContainsListWindow(owner, window) ) return false;
 	std::wstring target;
 	if( !ExactAnsiDirectoryToWide(directory, target) ) return false;
@@ -2731,6 +2890,8 @@ bool EnsureListDeleteWorker(HWND window, void* owner, const char* directory)
 		gListDeleteBatch.candidate.reset();
 		gListDeleteBatch.pendingApply = false;
 		gListDeleteBatch.bootstrapPending = false;
+		gListDeleteBatch.pendingOnlyFileAdds = false;
+		gListDeleteBatch.pendingOnlyFileDeletes = false;
 		gListDeleteBatch.requestNeeded = false;
 		gListDeleteBatch.requestOutstanding = false;
 		gListDeleteBatch.pendingSince = 0;
@@ -2758,6 +2919,11 @@ void ScheduleListDeleteRefresh(bool apply, bool bootstrap)
 	const ULONGLONG now = ::GetTickCount64();
 	gListDeleteBatch.pendingApply = gListDeleteBatch.pendingApply || apply;
 	gListDeleteBatch.bootstrapPending = gListDeleteBatch.bootstrapPending || bootstrap;
+	if( apply )
+	{
+		gListDeleteBatch.pendingOnlyFileAdds = false;
+		gListDeleteBatch.pendingOnlyFileDeletes = false;
+	}
 	gListDeleteBatch.requestNeeded = true;
 	gListDeleteBatch.pendingSince = now;
 	gListDeleteBatch.quietSince = now;
@@ -2796,6 +2962,8 @@ LRESULT CALLBACK ListDeleteBatchSubclass(HWND window, UINT message, WPARAM wPara
 			gListDeleteBatch.candidate.reset();
 			gListDeleteBatch.pendingApply = false;
 			gListDeleteBatch.bootstrapPending = false;
+			gListDeleteBatch.pendingOnlyFileAdds = false;
+			gListDeleteBatch.pendingOnlyFileDeletes = false;
 			gListDeleteBatch.subclassAttached = false;
 			gListDeleteBatch.timerActive = false;
 			gListDeleteBatch.requestNeeded = false;
@@ -2873,8 +3041,22 @@ LRESULT CALLBACK ListDeleteBatchSubclass(HWND window, UINT message, WPARAM wPara
 				const bool bootstrap = gListDeleteBatch.bootstrapPending;
 				const bool apply = gListDeleteBatch.pendingApply;
 				bool incremental = false;
+				bool addSort = false;
+				bool sortFallback = false;
 				if( apply && gListDeleteBatch.committed )
-					incremental = OnlyRegularFilesRemoved(*gListDeleteBatch.committed, candidate.state);
+				{
+					incremental = gListDeleteBatchEnabled && gListDeleteBatch.pendingOnlyFileDeletes
+						&& OnlyRegularFilesRemoved(*gListDeleteBatch.committed, candidate.state);
+					const bool addedFilesOnly = gListAddSortBatchEnabled && gListDeleteBatch.pendingOnlyFileAdds
+						&& OnlyRegularFilesAdded(*gListDeleteBatch.committed, candidate.state);
+					const LRESULT currentListCount = ::SendMessageW(window, LVM_GETITEMCOUNT, 0, 0);
+					const bool baselineCountMatches = currentListCount >= 0
+						&& static_cast<size_t>(currentListCount) == gListDeleteBatch.committed->entries.size();
+					addSort = addedFilesOnly && baselineCountMatches
+						&& CanInvokeLeeyesListSort(gListDeleteBatch.owner, window, &candidate.state);
+					sortFallback = addedFilesOnly && !addSort;
+					incremental = incremental || addSort;
+				}
 				if( bootstrap || apply )
 				{
 					void* owner = gListDeleteBatch.owner;
@@ -2894,6 +3076,23 @@ LRESULT CALLBACK ListDeleteBatchSubclass(HWND window, UINT message, WPARAM wPara
 							const ULONGLONG resyncStarted = ::GetTickCount64();
 							#endif
 							applied = LeeyesInternalInvokeResync(owner, incremental ? TRUE : FALSE) != FALSE;
+							if( !applied && incremental )
+							{
+								incremental = false;
+								sortFallback = sortFallback || addSort;
+								addSort = false;
+								applied = LeeyesInternalInvokeResync(owner, FALSE) != FALSE;
+							}
+							const LRESULT mergedListCount = applied && addSort
+								? ::SendMessageW(window, LVM_GETITEMCOUNT, 0, 0) : -1;
+							if( applied && addSort && (mergedListCount < 0
+								|| static_cast<size_t>(mergedListCount) != candidate.state.entries.size()
+								|| !InvokeLeeyesListSort(owner, window, &candidate.state)) )
+							{
+								sortFallback = true;
+								incremental = false;
+								applied = LeeyesInternalInvokeResync(owner, FALSE) != FALSE;
+							}
 							#if UNICODEHACK_PATH_DEBUG
 							resyncMs = ::GetTickCount64() - resyncStarted;
 							#endif
@@ -2902,7 +3101,7 @@ LRESULT CALLBACK ListDeleteBatchSubclass(HWND window, UINT message, WPARAM wPara
 								#if UNICODEHACK_PATH_DEBUG
 								const ULONGLONG restoreStarted = ::GetTickCount64();
 								#endif
-								RestoreListSelection(selection);
+								RestoreListSelection(selection, true);
 								#if UNICODEHACK_PATH_DEBUG
 								restoreMs = ::GetTickCount64() - restoreStarted;
 								#endif
@@ -2915,8 +3114,9 @@ LRESULT CALLBACK ListDeleteBatchSubclass(HWND window, UINT message, WPARAM wPara
 					{
 						#if UNICODEHACK_PATH_DEBUG
 						const LRESULT listCount = ::SendMessageA(window, LVM_GETITEMCOUNT, 0, 0);
-						WriteDiagnostic("list_delete applied=1 incremental=%d entries=%lu list_count=%ld wait_ms=%llu resync_ms=%llu restore_ms=%llu",
-							incremental ? 1 : 0, static_cast<unsigned long>(candidate.state.entries.size()),
+						WriteDiagnostic("list_delete applied=1 incremental=%d add_sort=%d sort_fallback=%d entries=%lu list_count=%ld wait_ms=%llu resync_ms=%llu restore_ms=%llu",
+							incremental ? 1 : 0, addSort ? 1 : 0, sortFallback ? 1 : 0,
+							static_cast<unsigned long>(candidate.state.entries.size()),
 							static_cast<long>(listCount),
 							gListDeleteBatch.pendingSince ? now - gListDeleteBatch.pendingSince : 0, resyncMs, restoreMs);
 						#endif
@@ -2924,6 +3124,8 @@ LRESULT CALLBACK ListDeleteBatchSubclass(HWND window, UINT message, WPARAM wPara
 						catch( ... ) { gListDeleteBatch.committed.reset(); }
 						gListDeleteBatch.pendingApply = false;
 						gListDeleteBatch.bootstrapPending = !gListDeleteBatch.committed;
+						gListDeleteBatch.pendingOnlyFileAdds = false;
+						gListDeleteBatch.pendingOnlyFileDeletes = false;
 						gListDeleteBatch.requestNeeded = false;
 						gListDeleteBatch.requestOutstanding = false;
 						gListDeleteBatch.pendingSince = 0;
@@ -2941,6 +3143,8 @@ LRESULT CALLBACK ListDeleteBatchSubclass(HWND window, UINT message, WPARAM wPara
 						gListDeleteBatch.requestOutstanding = false;
 						gListDeleteBatch.pendingApply = true;
 						gListDeleteBatch.bootstrapPending = false;
+						gListDeleteBatch.pendingOnlyFileAdds = false;
+						gListDeleteBatch.pendingOnlyFileDeletes = false;
 						gListDeleteBatch.pendingSince = now;
 						gListDeleteBatch.quietSince = now;
 					}
@@ -2949,7 +3153,13 @@ LRESULT CALLBACK ListDeleteBatchSubclass(HWND window, UINT message, WPARAM wPara
 				{
 					if( gListDeleteWorker->Finish(candidate) )
 						gListDeleteBatch.committed.reset(new (std::nothrow) DirectorySnapshot::State(std::move(candidate.state)));
-					else { gListDeleteBatch.committed.reset(); gListDeleteBatch.bootstrapPending = true; }
+					else
+					{
+						gListDeleteBatch.committed.reset();
+						gListDeleteBatch.bootstrapPending = true;
+						gListDeleteBatch.pendingOnlyFileAdds = false;
+						gListDeleteBatch.pendingOnlyFileDeletes = false;
+					}
 				}
 				gListDeleteBatch.candidate.reset();
 			}
@@ -2968,11 +3178,13 @@ LRESULT CALLBACK ListDeleteBatchSubclass(HWND window, UINT message, WPARAM wPara
 			{
 				ListSelectionSnapshot selection = CaptureListSelection();
 				LeeyesInternalInvokeFullResync(const_cast<void*>(owner));
-				RestoreListSelection(selection);
+				RestoreListSelection(selection, true);
 			}
 			gListDeleteBatch.committed.reset();
 			gListDeleteBatch.pendingApply = false;
 			gListDeleteBatch.bootstrapPending = true;
+			gListDeleteBatch.pendingOnlyFileAdds = false;
+			gListDeleteBatch.pendingOnlyFileDeletes = false;
 			gListDeleteBatch.requestNeeded = true;
 			gListDeleteBatch.requestOutstanding = false;
 			gListDeleteBatch.pendingSince = now;
@@ -2997,6 +3209,8 @@ LRESULT CALLBACK ListDeleteBatchSubclass(HWND window, UINT message, WPARAM wPara
 			gListDeleteBatch.candidate.reset();
 			gListDeleteBatch.pendingApply = false;
 			gListDeleteBatch.bootstrapPending = false;
+			gListDeleteBatch.pendingOnlyFileAdds = false;
+			gListDeleteBatch.pendingOnlyFileDeletes = false;
 			gListDeleteBatch.subclassAttached = false;
 			gListDeleteBatch.timerActive = false;
 			if( gListDeleteWorker ) { try { gListDeleteWorker->SetTarget(L""); } catch( ... ) {} }
@@ -3014,24 +3228,39 @@ void ObserveListDeleteBatch(void* owner, HWND window, const char* directory)
 	if( !gListDeleteBatch.committed ) ScheduleListDeleteRefresh(false, true);
 }
 
-bool DeferListDeleteBatchResync(void* owner, HWND window, const char* directory)
+bool DeferListDeleteBatchResync(void* owner, HWND window, const char* directory,
+	bool onlyFileAdds, bool onlyFileDeletes)
 {
-	if( !gListDeleteBatchEnabled || !gListDeleteWorker || gListDeleteBatch.fallbackDisabled
+	if( !IsListStateBatchEnabled() || !gListDeleteWorker || gListDeleteBatch.fallbackDisabled
 		|| gListDeleteWorker->Failed() || gListDeleteWorker->Error() != ERROR_SUCCESS
 		|| !gListDeleteBatch.subclassAttached || !gListDeleteBatch.timerActive
 		|| !window || !::IsWindow(window) || !DispatchOwnerContainsListWindow(owner, window)
 		|| !directory ) return false;
+	if( !(onlyFileAdds && gListAddSortBatchEnabled)
+		&& !(onlyFileDeletes && gListDeleteBatchEnabled) ) return false;
 	std::wstring target;
 	if( !ExactAnsiDirectoryToWide(directory, target) || target != gListDeleteBatch.target
 		|| gListDeleteBatch.owner != owner || gListDeleteBatch.window != window ) return false;
+	if( !gListDeleteBatch.pendingApply )
+	{
+		gListDeleteBatch.pendingOnlyFileAdds = onlyFileAdds;
+		gListDeleteBatch.pendingOnlyFileDeletes = onlyFileDeletes;
+	}
+	else
+	{
+		gListDeleteBatch.pendingOnlyFileAdds = gListDeleteBatch.pendingOnlyFileAdds && onlyFileAdds;
+		gListDeleteBatch.pendingOnlyFileDeletes = gListDeleteBatch.pendingOnlyFileDeletes && onlyFileDeletes;
+	}
 	gListDeleteBatch.pendingApply = true;
 	gListDeleteBatch.bootstrapPending = false;
 	gListDeleteBatch.pendingSince = ::GetTickCount64();
 	gListDeleteBatch.quietSince = gListDeleteBatch.pendingSince;
 	gListDeleteBatch.requestNeeded = true;
 	#if UNICODEHACK_PATH_DEBUG
-	WriteDiagnostic("list_delete deferred=1 baseline_known=%d baseline_entries=%lu",
+	WriteDiagnostic("list_delete deferred=1 baseline_known=%d only_adds=%d only_deletes=%d baseline_entries=%lu",
 		gListDeleteBatch.committed ? 1 : 0,
+		gListDeleteBatch.pendingOnlyFileAdds ? 1 : 0,
+		gListDeleteBatch.pendingOnlyFileDeletes ? 1 : 0,
 		static_cast<unsigned long>(gListDeleteBatch.committed ? gListDeleteBatch.committed->entries.size() : 0));
 	#endif
 	return true;
@@ -3039,7 +3268,7 @@ bool DeferListDeleteBatchResync(void* owner, HWND window, const char* directory)
 
 void CompleteListDeleteBatchLegacyResync(void* owner, HWND window, const char* directory, bool legacyResynced)
 {
-	if( !gListDeleteBatchEnabled || !gListDeleteWorker || gListDeleteBatch.fallbackDisabled
+	if( !IsListStateBatchEnabled() || !gListDeleteWorker || gListDeleteBatch.fallbackDisabled
 		|| !owner || !window || !directory ) return;
 	std::wstring target;
 	if( !ExactAnsiDirectoryToWide(directory, target) || target != gListDeleteBatch.target
@@ -3053,6 +3282,8 @@ void CompleteListDeleteBatchLegacyResync(void* owner, HWND window, const char* d
 		gListDeleteBatch.committed.reset();
 		gListDeleteBatch.pendingApply = false;
 		gListDeleteBatch.bootstrapPending = true;
+		gListDeleteBatch.pendingOnlyFileAdds = false;
+		gListDeleteBatch.pendingOnlyFileDeletes = false;
 	}
 	else if( !gListDeleteBatch.committed ) gListDeleteBatch.bootstrapPending = true;
 	else if( !gListDeleteBatch.pendingApply ) return;
@@ -3063,87 +3294,10 @@ void CompleteListDeleteBatchLegacyResync(void* owner, HWND window, const char* d
 }
 
 #if UNICODEHACK_PATH_DEBUG
-typedef int (WINAPI *DiagnosticNaturalCompare)(PCWSTR, PCWSTR);
-struct DiagnosticNaturalLess
-{
-	DiagnosticNaturalCompare compare;
-	bool operator()(const std::wstring& a, const std::wstring& b) const { return compare(a.c_str(), b.c_str()) < 0; }
-};
-struct DiagnosticCaseLess
-{
-	bool operator()(const std::wstring& a, const std::wstring& b) const { return ::lstrcmpiW(a.c_str(), b.c_str()) < 0; }
-};
-bool DiagnosticSortKeysUnique(const DirectorySnapshot::State& state, int sortIndex)
-{
-	try
-	{
-		std::set<ULONGLONG> numeric;
-		HMODULE shlwapi = ::GetModuleHandleW(L"shlwapi.dll");
-		DiagnosticNaturalCompare compare = shlwapi ? reinterpret_cast<DiagnosticNaturalCompare>(::GetProcAddress(shlwapi, "StrCmpLogicalW")) : nullptr;
-		if( sortIndex == 0 && !compare ) return false;
-		std::set<std::wstring, DiagnosticNaturalLess> natural(DiagnosticNaturalLess{ compare });
-		std::set<std::wstring, DiagnosticCaseLess> insensitive;
-		for( const auto& entry : state.entries )
-		{
-			if( entry.attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) ) return false;
-			if( sortIndex == 0 )
-			{
-				// Leeyes uses an ANSI comparator; do not infer its equivalence
-				// classes for names outside the portable ASCII fixture domain.
-				for( wchar_t c : entry.name ) if( c > 0x7f ) return false;
-				if( !natural.insert(entry.name).second || !insensitive.insert(entry.name).second ) return false;
-			}
-			else
-			{
-				const ULONGLONG key = sortIndex == 1 ? entry.size : entry.written;
-				if( !numeric.insert(key).second ) return false;
-			}
-		}
-		if( sortIndex == 3 && numeric.size() > 1 )
-		{
-			// Reject timestamps closer than two seconds, including values on
-			// opposite sides of a coarse filesystem timestamp boundary.
-			auto previous = numeric.begin();
-			for( auto current = std::next(previous); current != numeric.end(); ++current, ++previous )
-				if( *current - *previous < 20000000ULL ) return false;
-		}
-		return true;
-	}
-	catch( ... ) { return false; }
-}
 bool InvokeDiagnosticListSort(void* owner, HWND window, const DirectorySnapshot::State* state)
 {
 	if( !state || ::GetEnvironmentVariableA("LEYEES_LIST_TEST_DISABLE_SORT", nullptr, 0) ) return false;
-	if( !owner || !window || !DispatchOwnerContainsListWindow(owner, window) ) return false;
-	BYTE* image = reinterpret_cast<BYTE*>(::GetModuleHandleW(nullptr));
-	if( reinterpret_cast<ULONG_PTR>(image) != 0x00400000 ) return false;
-	const BYTE signature[] = { 0x55,0x8b,0xec,0x83,0xc4,0xf8,0x89,0x45,0xf8,
-		0x8b,0x45,0xf8,0x8b,0x80,0x84,0x03,0x00,0x00,0x85,0xc0,0x7c,0x47 };
-	BYTE* sort = image + 0x000d6f04;
-	if( !IsReadableRange(sort, sizeof(signature)) || memcmp(sort, signature, sizeof(signature)) != 0 ) return false;
-	__try
-	{
-		BYTE* object = static_cast<BYTE*>(owner);
-		if( !IsReadableRange(object + 0x384, sizeof(DWORD)) || !IsReadableRange(object + 0x404, sizeof(DWORD)) ) return false;
-		const int sortIndex = *reinterpret_cast<const int*>(object + 0x384);
-		// Only these modes have a distinct-key fixture checked against the
-		// filesystem. In another mode equal keys produced different ordering
-		// from the original full rebuild, so leave that path to Leeyes.
-		if( sortIndex != 0 && sortIndex != 1 && sortIndex != 3 ) return false;
-		if( !DiagnosticSortKeysUnique(*state, sortIndex) ) return false;
-		const BYTE* items = *reinterpret_cast<BYTE* const*>(object + 0x404);
-		if( !IsReadableRange(items, 12) ) return false;
-		const int internalCount = *reinterpret_cast<const int*>(items + 8);
-		const int listCount = static_cast<int>(::SendMessageW(window, LVM_GETITEMCOUNT, 0, 0));
-		if( internalCount < 0 || internalCount != listCount ) return false;
-		__asm {
-			mov eax, owner
-			call sort
-		}
-		if( listCount > 0 ) ::SendMessageW(window, LVM_REDRAWITEMS, 0, listCount - 1);
-		return true;
-	}
-	__except( EXCEPTION_EXECUTE_HANDLER ) { return false; }
+	return InvokeLeeyesListSort(owner, window, state);
 }
 bool ApplyShadowPending(bool incremental, bool verifyFallback, bool sortAfter, const DirectorySnapshot::State* sortState)
 {
@@ -3858,11 +4012,17 @@ void ConfigureListDeleteBatch(bool enabled)
 	gListDeleteBatchEnabled = enabled;
 }
 
+void ConfigureListAddSortBatch(bool enabled)
+{
+	gListAddSortBatchEnabled = enabled;
+}
+
 void ResetFileMoveBatchState()
 {
 	gDrainState = DrainState();
 	gDiagnosticLog = false;
 	gListDeleteBatchEnabled = false;
+	gListAddSortBatchEnabled = false;
 }
 
 extern "C" void __cdecl LeeyesInternalBeginChangeQueueDrain(void* notifier)
@@ -3874,6 +4034,8 @@ extern "C" void __cdecl LeeyesInternalBeginChangeQueueDrain(void* notifier)
 	}
 	gDrainState = DrainState();
 	gDrainState.depth = 1;
+	gDrainState.onlyFileAdds = true;
+	gDrainState.onlyFileDeletes = true;
 	#if UNICODEHACK_PATH_DEBUG
 	gReplaySingle = ReplaySingleDiagnostic();
 	gDrainState.unchangedSkipEligible = true;
@@ -3918,7 +4080,7 @@ extern "C" void __cdecl LeeyesInternalBeginChangeQueueDrain(void* notifier)
 		static_cast<unsigned long>(gDrainState.queuedChanges),
 		static_cast<unsigned long>(gBatchThreshold), gDrainState.suppress ? 1 : 0);
 	#endif
-	if( gDrainState.suppress || gListDeleteBatchEnabled )
+	if( gDrainState.suppress || IsListStateBatchEnabled() )
 	{
 		#if UNICODEHACK_PATH_DEBUG
 		if( gDrainState.suppress )
@@ -3977,13 +4139,33 @@ BOOL LeeyesInternalShouldDeferFileChangeImpl(
 		}
 	}
 	#endif
-	if( !gDrainState.suppress && !gListDeleteBatchEnabled ) return FALSE;
+	if( !gDrainState.suppress && !IsListStateBatchEnabled() ) return FALSE;
 	const DWORD action = rawAction & 0xFF;
 	// The dispatcher has a separate control-action branch (6) in the verified
 	// Leeyes 2.6.1 body. It is not a filesystem item change and must continue
 	// through Leeyes' own state machine. Leeyes loads the action into DL, so
 	// EDX's upper 24 bits are unspecified and must not be treated as flags.
-	if( action > 5 ) return FALSE;
+	if( action == 6 || action > 6 )
+	{
+		gDrainState.onlyFileAdds = false;
+		gDrainState.onlyFileDeletes = false;
+		return FALSE;
+	}
+	if( action == 0 )
+	{
+		gDrainState.sawFileAdd = true;
+		gDrainState.onlyFileDeletes = false;
+	}
+	else if( action == 2 )
+	{
+		gDrainState.sawFileDelete = true;
+		gDrainState.onlyFileAdds = false;
+	}
+	else
+	{
+		gDrainState.onlyFileAdds = false;
+		gDrainState.onlyFileDeletes = false;
+	}
 	if( !gDrainState.currentOwnerKnown
 		&& gDrainState.currentListWindow
 		&& gDrainState.ownerProbeAttempts < 8 )
@@ -4051,7 +4233,7 @@ BOOL LeeyesInternalShouldDeferFileChangeImpl(
 				dispatchOwner);
 		return FALSE;
 	}
-	if( gListDeleteBatchEnabled && !gDrainState.listStateWatchAttempted )
+	if( IsListStateBatchEnabled() && !gDrainState.listStateWatchAttempted )
 		ObserveListDeleteBatch(dispatchOwner, gDrainState.currentListWindow, gDrainState.currentDirectory);
 	if( !gDrainState.suppress ) return FALSE;
 	#if UNICODEHACK_PATH_DEBUG
@@ -4210,6 +4392,8 @@ extern "C" void __cdecl LeeyesInternalEndChangeQueueDrain()
 	const DWORD suppressedChanges = gDrainState.suppressedChanges;
 	const DWORD outOfScopeChanges = gDrainState.outOfScopeChanges;
 	const DWORD unknownScopeChanges = gDrainState.unknownScopeChanges;
+	const bool onlyFileAdds = gDrainState.sawFileAdd && gDrainState.onlyFileAdds;
+	const bool onlyFileDeletes = gDrainState.sawFileDelete && gDrainState.onlyFileDeletes;
 	const HWND listWindow = gDrainState.currentListWindow;
 	const bool listStateWatchAttempted = gDrainState.listStateWatchAttempted;
 	const bool currentDirectoryKnown = gDrainState.currentDirectoryKnown;
@@ -4226,9 +4410,11 @@ extern "C" void __cdecl LeeyesInternalEndChangeQueueDrain()
 		memcpy(dirtyLists, gDrainState.dirtyLists,
 			dirtyListCount * sizeof(gDrainState.dirtyLists[0]));
 	bool deferListResync = false;
-	if( needsResync && gListDeleteBatchEnabled && listStateWatchAttempted && currentDirectoryKnown
+	if( needsResync && IsListStateBatchEnabled() && listStateWatchAttempted && currentDirectoryKnown
+		&& suppressedChanges == queuedChanges && outOfScopeChanges == 0 && unknownScopeChanges == 0
 		&& dirtyListCount == 1 && listStateOwner && dirtyLists[0] == listStateOwner )
-		deferListResync = DeferListDeleteBatchResync(listStateOwner, listWindow, listStateDirectory);
+		deferListResync = DeferListDeleteBatchResync(listStateOwner, listWindow, listStateDirectory,
+			onlyFileAdds, onlyFileDeletes);
 	#if UNICODEHACK_PATH_DEBUG
 	if( gDrainState.suppress ) LeeyesTreeShadowEnd();
 	#endif
@@ -4354,7 +4540,7 @@ extern "C" void __cdecl LeeyesInternalEndChangeQueueDrain()
 			captureTick - beginTick, resyncTick - captureTick, ::GetTickCount64() - resyncTick);
 		#endif
 	}
-	if( gListDeleteBatchEnabled && listStateWatchAttempted && listStateOwner
+	if( IsListStateBatchEnabled() && listStateWatchAttempted && listStateOwner
 		&& currentDirectoryKnown && !deferListResync )
 		CompleteListDeleteBatchLegacyResync(listStateOwner, listWindow, listStateDirectory,
 			needsResync && !deferListResync);
