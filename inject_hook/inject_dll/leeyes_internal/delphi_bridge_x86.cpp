@@ -3883,18 +3883,25 @@ extern "C" __declspec(naked) void LeeyesInternalChangeQueueDrainHook()
 
 extern "C" void __cdecl LeeyesInternalInvokeFullResync(void* listView)
 {
-	if( !listView || !gLeeyesInternalFullResync ) return;
-	BYTE full = 1;
+	BOOL incremental = FALSE;
 	#if UNICODEHACK_PATH_DEBUG
-	// Experimental only: DL=0 enters Leeyes' own merge path at 0x004E1BF4.
-	if( ::GetEnvironmentVariableA("LEYEES_INCREMENTAL_RESYNC_EXPERIMENT", nullptr, 0) ) full = 0;
+	// Diagnostic only: DL=0 enters Leeyes' own merge path at 0x004E1BF4.
+	if( ::GetEnvironmentVariableA("LEYEES_INCREMENTAL_RESYNC_EXPERIMENT", nullptr, 0) ) incremental = TRUE;
 	#endif
+	LeeyesInternalInvokeResync(listView, incremental);
+}
+
+extern "C" BOOL __cdecl LeeyesInternalInvokeResync(void* listView, BOOL incremental)
+{
+	if( !listView || !gLeeyesInternalFullResync ) return FALSE;
+	const BYTE full = incremental ? 0 : 1;
 	__asm
 	{
 		mov eax, listView
 		mov dl, full
 		call dword ptr [gLeeyesInternalFullResync]
 	}
+	return TRUE;
 }
 
 #if UNICODEHACK_PATH_DEBUG
@@ -3917,14 +3924,7 @@ extern "C" BOOL __cdecl LeeyesDiagnosticInvokeResync(void* listView, BOOL increm
 	static bool unavailableInjected = false;
 	if( !unavailableInjected && ::GetEnvironmentVariableA("LEYEES_LIST_TEST_RESYNC_UNAVAILABLE_ONCE", nullptr, 0) )
 	{ unavailableInjected = true; return FALSE; }
-	const BYTE full = incremental ? 0 : 1;
-	__asm
-	{
-		mov eax, listView
-		mov dl, full
-		call dword ptr [gLeeyesInternalFullResync]
-	}
-	return TRUE;
+	return LeeyesInternalInvokeResync(listView, incremental);
 }
 #endif
 
