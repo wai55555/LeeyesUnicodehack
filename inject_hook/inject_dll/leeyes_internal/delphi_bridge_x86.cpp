@@ -291,6 +291,13 @@ std::atomic<unsigned long> gTreeRemovalSkipped(0);
 DWORD gTreeRemovalReturnSite = 0;
 DWORD gTreeRemovalOwner = 0;
 HWND gTreeRemovalWindow = nullptr;
+HTREEITEM gTreeRemovalParentItem = nullptr;
+DWORD gTreeRemovalParentNode = 0;
+std::wstring gTreeRemovalParentPath;
+bool gTreeRemovalRescanning = false;
+bool gTreeRemovalProbeRejected = false;
+unsigned char gTreeRemovalTimerTag = 0;
+const UINT_PTR kTreeRemovalTimerId = reinterpret_cast<UINT_PTR>(&gTreeRemovalTimerTag);
 std::atomic<unsigned long long> gTreeActionCounts[7] = {};
 std::atomic<unsigned long long> gTreeSearchCalls(0);
 std::atomic<unsigned long long> gTreeSearchHits(0);
@@ -2064,6 +2071,29 @@ void InvokeTreeRescanProtected(DWORD owner, DWORD node, void (__cdecl *rescan)()
 	}
 	__finally { gTreeSilentRescan = false; }
 }
+bool TreeRemovalParentCurrent(HWND window, HTREEITEM item, DWORD node,
+	const std::wstring& path, bool requireExpanded, DWORD* observedFlags = nullptr)
+{
+	DWORD flags = 0;
+	if( !window || !::IsWindow(window) || !item || !node )
+	{ if( observedFlags ) *observedFlags = flags; return false; }
+	TVITEMW state = {};
+	state.mask = TVIF_PARAM | TVIF_STATE;
+	state.stateMask = TVIS_EXPANDED;
+	state.hItem = item;
+	if( ::SendMessageW(window, TVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&state)) ) flags |= 1;
+	if( (flags & 1) && static_cast<DWORD>(state.lParam) == node ) flags |= 2;
+	if( (flags & 2) && (state.state & TVIS_EXPANDED) ) flags |= 16;
+	TreeNodeObservation observed = {};
+	if( (flags & 2) && ObserveTreeNode(node, observed) ) flags |= 4;
+	if( (flags & 4) && TreeStateCachedPathMatches(observed, path) ) flags |= 8;
+	if( observedFlags ) *observedFlags = flags;
+	return (flags & 15) == 15 && (!requireExpanded || (flags & 16) != 0);
+}
+bool TreeRemovalAllowsCollapsedParent()
+{
+	return ::GetEnvironmentVariableA("LEYEES_TREE_REMOVAL_ALLOW_COLLAPSED", nullptr, 0) != 0;
+}
 LRESULT CALLBACK RecoveryExpansionNotifyProbe(HWND window, UINT message, WPARAM wParam, LPARAM lParam,
 	UINT_PTR subclassId, DWORD_PTR reference)
 {
@@ -2107,8 +2137,60 @@ LRESULT CALLBACK RescanDiagnosticSubclass(HWND window, UINT message, WPARAM wPar
 	}
 	if( message == WM_NCDESTROY )
 	{
+		if( gTreeRemovalWindow == window )
+		{
+			::KillTimer(window, kTreeRemovalTimerId);
+			gTreeRemovalWindow = nullptr;
+			gTreeRemovalOwner = 0;
+			gTreeRemovalParentItem = nullptr;
+			gTreeRemovalParentNode = 0;
+			gTreeRemovalParentPath.clear();
+			gTreeRemovalProbeRejected = false;
+		}
 		if( gTreeStateProbe.window == window && (gTreeStateProbe.first || gTreeStateProbe.batchMode) ) FinishTreeStateProbe(true, 4);
 		::RemoveWindowSubclass(window, RescanDiagnosticSubclass, subclassId);
+	}
+	if( message == WM_TIMER && wParam == kTreeRemovalTimerId && gTreeRemovalWindow == window )
+	{
+		::KillTimer(window, kTreeRemovalTimerId);
+		const DWORD owner = gTreeRemovalOwner;
+		if( gTreeRemovalRescanning ) return 0;
+		DWORD beforeFlags = 0;
+		const bool requireExpanded = !TreeRemovalAllowsCollapsedParent();
+		const bool parentCurrentBefore = TreeRemovalParentCurrent(window, gTreeRemovalParentItem,
+			gTreeRemovalParentNode, gTreeRemovalParentPath, requireExpanded, &beforeFlags);
+		if( !owner || !DiagnosticOwnerContainsWindow(owner, window)
+			|| !parentCurrentBefore || !gLeeyesInternalTreeDirectoryRescan || !gTreeSilentHooksReady )
+		{
+			LeeyesTreeRescanObserve(owner, 0, 0xF0000070);
+			return 0;
+		}
+		LeeyesTreeRescanObserve(owner, gTreeRemovalSkipped.load(std::memory_order_relaxed), 0xF0000070);
+		LARGE_INTEGER started = {}, ended = {}, frequency = {};
+		::QueryPerformanceFrequency(&frequency);
+		::QueryPerformanceCounter(&started);
+		gTreeRemovalRescanning = true;
+		gTreeSilentRescan = true;
+		gTreeShellEnumFailure = S_OK;
+		InvokeTreeRescanProtected(owner, gTreeRemovalParentNode, gLeeyesInternalTreeDirectoryRescan);
+		gTreeRemovalRescanning = false;
+		::QueryPerformanceCounter(&ended);
+		if( frequency.QuadPart > 0 && ended.QuadPart >= started.QuadPart )
+		{
+			const ULONGLONG micros = static_cast<ULONGLONG>(ended.QuadPart - started.QuadPart)
+				* 1000000ULL / static_cast<ULONGLONG>(frequency.QuadPart);
+			LeeyesTreeRescanObserve(owner, static_cast<DWORD>(micros > MAXDWORD ? MAXDWORD : micros), 0xF0000071);
+		}
+		LeeyesTreeRescanObserve(owner, static_cast<DWORD>(gTreeShellEnumFailure), 0xF0000072);
+		DWORD afterFlags = 0;
+		const bool parentCurrentAfter = TreeRemovalParentCurrent(window, gTreeRemovalParentItem,
+			gTreeRemovalParentNode, gTreeRemovalParentPath, false, &afterFlags);
+		LeeyesTreeRescanObserve(owner,
+			parentCurrentAfter ? 1 : 0, 0xF0000073);
+		LeeyesTreeRescanObserve(owner,
+			parentCurrentBefore && parentCurrentAfter && ((beforeFlags ^ afterFlags) & 16) == 0 ? 1 : 0,
+			0xF0000077);
+		return 0;
 	}
 	if( message == WM_TIMER && wParam == reinterpret_cast<UINT_PTR>(&gTreeStateProbe) + 3
 		&& gTreeStateProbe.applyingDirectChanges && gTreeStateProbe.window == window )
@@ -3654,10 +3736,17 @@ extern "C" void __cdecl LeeyesTreeTimingRead(unsigned long long* calls,
 	*ticks = gTreeTimingTicks.load(std::memory_order_relaxed);
 	*frequency = static_cast<unsigned long long>(value.QuadPart);
 }
+bool ReadTreeRemovalOwner(DWORD frame, DWORD& owner)
+{
+	__try { owner = *reinterpret_cast<const DWORD*>(frame - 8); return owner != 0; }
+	__except( EXCEPTION_EXECUTE_HANDLER ) { owner = 0; return false; }
+}
 extern "C" BOOL __cdecl LeeyesTreeProbeSkipRemoval(DWORD pathPointer, DWORD frame, DWORD caller)
 {
 	if( !gTreeRemovalReturnSite || caller != gTreeRemovalReturnSite || !frame
-		|| !gLeeyesInternalTreeDirectoryRescan || !gTreeSilentHooksReady ) return FALSE;
+		|| gTreeRemovalRescanning || !gLeeyesInternalTreeDirectoryRescan || !gTreeSilentHooksReady
+		|| !::GetEnvironmentVariableA("LEYEES_TREE_DIRECTORY_RESCAN", nullptr, 0)
+		|| !::GetEnvironmentVariableA("LEYEES_TREE_SILENT_OWNER", nullptr, 0) ) return FALSE;
 	char parent[1040] = {}, path[1040] = {};
 	const DWORD size = ::GetEnvironmentVariableA("LEYEES_TREE_REMOVAL_PARENT", parent, _countof(parent));
 	DWORD length = 0;
@@ -3665,20 +3754,72 @@ extern "C" BOOL __cdecl LeeyesTreeProbeSkipRemoval(DWORD pathPointer, DWORD fram
 		|| length <= size + 1 || _strnicmp(path, parent, size) != 0
 		|| (path[size] != '\\' && path[size] != '/')
 		|| strchr(path + size + 1, '\\') || strchr(path + size + 1, '/') ) return FALSE;
+	const char* backslash = strrchr(path, '\\');
+	const char* slash = strrchr(path, '/');
+	const char* separator = !backslash ? slash : !slash ? backslash : (backslash > slash ? backslash : slash);
+	if( !separator ) return FALSE;
+	size_t parentLength = static_cast<size_t>(separator - path);
+	if( parentLength == 2 && path[1] == ':' ) ++parentLength;
 	DWORD owner = 0;
-	__try { owner = *reinterpret_cast<const DWORD*>(frame - 8); }
-	__except( EXCEPTION_EXECUTE_HANDLER ) { return FALSE; }
-	if( !owner ) return FALSE;
+	if( !ReadTreeRemovalOwner(frame, owner) ) return FALSE;
 	if( !gTreeRemovalOwner )
 	{
 		TreeWindowSearch found = { owner, nullptr, 0 };
 		::EnumThreadWindows(::GetCurrentThreadId(), FindDiagnosticTreeTop, reinterpret_cast<LPARAM>(&found));
-		if( found.count != 1 || !::SetWindowSubclass(found.window, RescanDiagnosticSubclass,
-			reinterpret_cast<UINT_PTR>(&gLeeyesInternalOriginalTreeRescanProbe), owner) ) return FALSE;
+		if( found.count != 1 ) return FALSE;
 		gTreeRemovalOwner = owner; gTreeRemovalWindow = found.window;
 		LeeyesTreeRescanObserve(owner, reinterpret_cast<DWORD>(found.window), 0xF000000A);
 	}
 	if( owner != gTreeRemovalOwner || !::IsWindow(gTreeRemovalWindow) ) return FALSE;
+	if( !::SetWindowSubclass(gTreeRemovalWindow, RescanDiagnosticSubclass,
+		reinterpret_cast<UINT_PTR>(&gLeeyesInternalOriginalTreeRescanProbe), owner) ) return FALSE;
+	if( gTreeRemovalProbeRejected ) return FALSE;
+	std::wstring parentPath;
+	try
+	{
+		parentPath.reserve(parentLength);
+		for( size_t i = 0; i < parentLength; ++i )
+		{
+			const unsigned char c = static_cast<unsigned char>(path[i]);
+			if( c > 0x7f ) return FALSE;
+			parentPath.push_back(static_cast<wchar_t>(c));
+		}
+	}
+	catch( ... ) { return FALSE; }
+	HTREEITEM parentItem = gTreeRemovalParentItem;
+	DWORD parentNode = gTreeRemovalParentNode;
+	const bool firstParentObservation = parentItem == nullptr;
+	if( parentItem )
+	{
+		if( _wcsicmp(parentPath.c_str(), gTreeRemovalParentPath.c_str()) != 0 ) return FALSE;
+	}
+	else
+	{
+		parentItem = FindFixtureParent(gTreeRemovalWindow, parentPath.c_str());
+		LeeyesTreeRescanObserve(owner, parentItem ? 1 : 0, 0xF0000074);
+		if( !parentItem ) { gTreeRemovalProbeRejected = true; return FALSE; }
+		TVITEMW item = {};
+		item.mask = TVIF_PARAM;
+		item.hItem = parentItem;
+		if( !::SendMessageW(gTreeRemovalWindow, TVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&item)) || !item.lParam )
+		{ gTreeRemovalProbeRejected = true; return FALSE; }
+		parentNode = static_cast<DWORD>(item.lParam);
+	}
+	DWORD parentFlags = 0;
+	const bool parentCurrent = TreeRemovalParentCurrent(gTreeRemovalWindow, parentItem, parentNode,
+		parentPath, !TreeRemovalAllowsCollapsedParent(), &parentFlags);
+	if( firstParentObservation || !parentCurrent ) LeeyesTreeRescanObserve(owner, parentFlags, 0xF0000075);
+	if( !parentCurrent ) { gTreeRemovalProbeRejected = true; return FALSE; }
+	char quietText[16] = {};
+	const DWORD quietLength = ::GetEnvironmentVariableA("LEYEES_TREE_REMOVAL_QUIET_MS", quietText, _countof(quietText));
+	unsigned quietMs = quietLength && quietLength < _countof(quietText) ? strtoul(quietText, nullptr, 10) : 300;
+	if( quietMs < 50 || quietMs > 5000 ) quietMs = 300;
+	if( !::SetTimer(gTreeRemovalWindow, kTreeRemovalTimerId, quietMs, nullptr) )
+	{ LeeyesTreeRescanObserve(owner, 0, 0xF0000076); gTreeRemovalProbeRejected = true; return FALSE; }
+	gTreeRemovalParentItem = parentItem;
+	gTreeRemovalParentNode = parentNode;
+	if( gTreeRemovalParentPath.empty() ) gTreeRemovalParentPath.swap(parentPath);
+	if( firstParentObservation ) LeeyesTreeRescanObserve(owner, quietMs, 0xF0000076);
 	gTreeRemovalSkipped.fetch_add(1, std::memory_order_relaxed);
 	return TRUE;
 }
