@@ -2810,6 +2810,12 @@ LRESULT CALLBACK ListDeleteBatchSubclass(HWND window, UINT message, WPARAM wPara
 			gListDeleteBatch.observedDirty = dirty;
 			gListDeleteBatch.quietSince = now;
 			if( gListDeleteBatch.pendingApply ) gListDeleteBatch.pendingSince = now;
+			if( gListDeleteBatch.requestOutstanding )
+			{
+				gListDeleteBatch.requestOutstanding = false;
+				gListDeleteBatch.requestNeeded = true;
+				gListDeleteBatch.requestSince = 0;
+			}
 			if( gListDeleteBatch.candidate )
 			{
 				bool releasedCurrent = false;
@@ -3012,6 +3018,7 @@ bool DeferListDeleteBatchResync(void* owner, HWND window, const char* directory)
 {
 	if( !gListDeleteBatchEnabled || !gListDeleteWorker || gListDeleteBatch.fallbackDisabled
 		|| gListDeleteWorker->Failed() || gListDeleteWorker->Error() != ERROR_SUCCESS
+		|| !gListDeleteBatch.subclassAttached || !gListDeleteBatch.timerActive
 		|| !window || !::IsWindow(window) || !DispatchOwnerContainsListWindow(owner, window)
 		|| !directory ) return false;
 	std::wstring target;
