@@ -207,6 +207,60 @@ struct ParentSession
 
 std::vector<ParentSession> gParents;
 
+// Negative attach results are cached briefly. A bulk move can deliver thousands
+// of notifications for a parent that cannot be batched (collapsed or leaf node);
+// walking the tree for each of them would be slower than Leeyes' original path.
+struct AttachFailure
+{
+	DWORD pathKey = 0;
+	ULONGLONG retryAfter = 0;
+};
+const size_t kAttachFailureCapacity = 8;
+const ULONGLONG kAttachFailureWindowMs = 1000;
+std::vector<AttachFailure> gAttachFailures;
+
+bool TreeBatchAttachRecentlyFailed(DWORD pathKey)
+{
+	const ULONGLONG now = ::GetTickCount64();
+	for( auto it = gAttachFailures.begin(); it != gAttachFailures.end(); )
+	{
+		if( it->pathKey == pathKey && now < it->retryAfter ) return true;
+		if( now >= it->retryAfter ) it = gAttachFailures.erase(it);
+		else ++it;
+	}
+	return false;
+}
+
+void TreeBatchRememberAttachFailure(DWORD pathKey)
+{
+	const ULONGLONG now = ::GetTickCount64();
+	for( auto& failure : gAttachFailures )
+		if( failure.pathKey == pathKey )
+		{
+			failure.retryAfter = now + kAttachFailureWindowMs;
+			return;
+		}
+	if( gAttachFailures.size() >= kAttachFailureCapacity )
+	{
+		// Drop the entry that expires first.
+		size_t oldest = 0;
+		for( size_t i = 1; i < gAttachFailures.size(); ++i )
+			if( gAttachFailures[i].retryAfter < gAttachFailures[oldest].retryAfter ) oldest = i;
+		gAttachFailures.erase(gAttachFailures.begin() + oldest);
+	}
+	try { gAttachFailures.push_back({ pathKey, now + kAttachFailureWindowMs }); }
+	catch( ... ) {}
+}
+
+void TreeBatchClearAttachFailure(DWORD pathKey)
+{
+	for( auto it = gAttachFailures.begin(); it != gAttachFailures.end(); )
+	{
+		if( it->pathKey == pathKey ) it = gAttachFailures.erase(it);
+		else ++it;
+	}
+}
+
 LRESULT CALLBACK TreeNotificationBatchSubclass(HWND window, UINT message, WPARAM wParam, LPARAM lParam,
 	UINT_PTR subclassId, DWORD_PTR reference);
 void TreeBatchMarkUnavailable(ParentSession& parent, const char* reason);
@@ -810,12 +864,14 @@ void TreeBatchCloseWindow(HWND window)
 bool TreeBatchAttachParent(DWORD owner, HWND window, const std::wstring& path)
 {
 	const DWORD pathKey = TreeBatchPathKey(path);
+	if( TreeBatchAttachRecentlyFailed(pathKey) ) return false;
 	const ULONGLONG attachStarted = ::GetTickCount64();
 	const auto fail = [pathKey, attachStarted](const char* reason)
 	{
-		TreeBatchLog("tree_batch_attach_failed parent_key=%08lX reason=%s elapsed_ms=%llu length=%u",
+		TreeBatchRememberAttachFailure(pathKey);
+		TreeBatchLog("tree_batch_attach_failed parent_key=%08lX reason=%s elapsed_ms=%llu tick_ms=%llu",
 			static_cast<unsigned long>(pathKey), reason,
-			::GetTickCount64() - attachStarted, 0u);
+			::GetTickCount64() - attachStarted, ::GetTickCount64());
 		return false;
 	};
 	if( !owner || !window || !::IsWindow(window) || !TreeOwnerContainsWindow(owner, window) )
@@ -872,13 +928,14 @@ bool TreeBatchAttachParent(DWORD owner, HWND window, const std::wstring& path)
 		DWORD expectedHash = 2166136261u;
 		for( size_t i = 0; i < probeEncoded.size(); ++i )
 			expectedHash = (expectedHash ^ static_cast<unsigned char>(probeEncoded[i])) * 16777619u;
-		TreeBatchLog("tree_batch_attach_search_failed parent_key=%08lX search_ms=%llu path_length=%u encode=%u root=%u root_item=%u expected_hash=%08lX expected_bytes=%u visited=%llu path_nodes=%llu item_failures=%llu verify_failed=%u",
+		TreeBatchLog("tree_batch_attach_search_failed parent_key=%08lX search_ms=%llu path_length=%u encode=%u root=%u root_item=%u expected_hash=%08lX expected_bytes=%u visited=%llu path_nodes=%llu item_failures=%llu verify_failed=%u tick_ms=%llu",
 			static_cast<unsigned long>(pathKey), ::GetTickCount64() - searchStarted,
 			static_cast<unsigned>(path.size()), encodeOk ? 1u : 0u,
 			probeRoot ? 1u : 0u, rootItemOk ? 1u : 0u,
 			static_cast<unsigned long>(expectedHash), static_cast<unsigned>(probeEncoded.size()),
 			gTreePathSearchVisited, gTreePathSearchPathNodes,
-			gTreePathSearchItemFailures, gTreePathSearchVerifyFailed ? 1u : 0u);
+			gTreePathSearchItemFailures, gTreePathSearchVerifyFailed ? 1u : 0u,
+			::GetTickCount64());
 		return fail("node_not_found");
 	}
 	ParentSession parent;
@@ -969,6 +1026,7 @@ bool TreeBatchAttachParent(DWORD owner, HWND window, const std::wstring& path)
 		}
 		return fail("timer_arm");
 	}
+	TreeBatchClearAttachFailure(pathKey);
 	TreeBatchLog("tree_batch_parent_attached parent_key=%08lX slot=%u reuse=%u parents=%u quiet_ms=%u mode=%u",
 		static_cast<unsigned long>(pathKey), slot, reuse ? 1u : 0u,
 		static_cast<unsigned>(gParents.size()), gQuietIntervalMs, gBatchMode);
