@@ -77,9 +77,15 @@ extern "C" __declspec(dllexport) void WINAPI InitializeLeeyesInternalHooks()
 		&& ReadInternalSetting("FileMoveDeleteBatch", 0) != 0;
 	const bool listAddSortBatchEnabled = batchEnabled
 		&& ReadInternalSetting("FileMoveAddSortBatch", 0) != 0;
+	// Stage 4 (folder-tree notification batching) is enabled by default.
+	// The legacy boolean keeps its meaning: an explicit FileMoveTreeBatch=0 still
+	// disables it, and an explicit FileMoveTreeBatchMode always wins.
 	int treeNotificationBatchMode = ReadInternalSetting("FileMoveTreeBatchMode", -1);
 	if( treeNotificationBatchMode < 0 )
-		treeNotificationBatchMode = ReadInternalSetting("FileMoveTreeBatch", 0) != 0 ? 2 : 0;
+	{
+		const int legacyTreeBatch = ReadInternalSetting("FileMoveTreeBatch", -1);
+		treeNotificationBatchMode = legacyTreeBatch < 0 ? 2 : (legacyTreeBatch != 0 ? 2 : 0);
+	}
 	if( treeNotificationBatchMode < 0 || treeNotificationBatchMode > 2 ) treeNotificationBatchMode = 0;
 	const bool treeNotificationBatchEnabled = treeNotificationBatchMode != 0;
 	#if UNICODEHACK_PATH_DEBUG
