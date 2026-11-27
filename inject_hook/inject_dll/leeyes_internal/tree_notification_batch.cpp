@@ -2698,6 +2698,19 @@ bool TreeBatchShouldSuppress(DWORD pathPointer, DWORD frame, DWORD caller)
 	if( !parent->baselineReady || !parent->suppressionReady || !parent->worker
 		|| parent->worker->Failed() || parent->worker->Error() != ERROR_SUCCESS )
 	{
+		static ULONGLONG lastForwardLog = 0;
+		const ULONGLONG forwardNow = ::GetTickCount64();
+		if( forwardNow - lastForwardLog >= 500 )
+		{
+			lastForwardLog = forwardNow;
+			TreeBatchLog("tree_batch_hook_forward parent_key=%08lX baseline=%u suppress_ready=%u worker=%u failed=%u error=%lu flat=%u",
+				static_cast<unsigned long>(TreeBatchPathKey(parentPath)),
+				parent->baselineReady ? 1u : 0u, parent->suppressionReady ? 1u : 0u,
+				parent->worker ? 1u : 0u,
+				(parent->worker && parent->worker->Failed()) ? 1u : 0u,
+				parent->worker ? static_cast<unsigned long>(parent->worker->Error()) : 0ul,
+				parent->flatCandidate ? 1u : 0u);
+		}
 		parent->dirty = true;
 		parent->suppressionReady = false;
 		parent->refreshRequested = false;
@@ -2772,6 +2785,19 @@ DWORD TreeBatchShouldSuppressFolderSearch(DWORD pathPointer, DWORD frame, DWORD 
 	if( !parent->baselineReady || !parent->suppressionReady || !parent->worker
 		|| parent->worker->Failed() || parent->worker->Error() != ERROR_SUCCESS )
 	{
+		static ULONGLONG lastForwardLog = 0;
+		const ULONGLONG forwardNow = ::GetTickCount64();
+		if( forwardNow - lastForwardLog >= 500 )
+		{
+			lastForwardLog = forwardNow;
+			TreeBatchLog("tree_batch_hook_forward parent_key=%08lX baseline=%u suppress_ready=%u worker=%u failed=%u error=%lu flat=%u",
+				static_cast<unsigned long>(TreeBatchPathKey(parentPath)),
+				parent->baselineReady ? 1u : 0u, parent->suppressionReady ? 1u : 0u,
+				parent->worker ? 1u : 0u,
+				(parent->worker && parent->worker->Failed()) ? 1u : 0u,
+				parent->worker ? static_cast<unsigned long>(parent->worker->Error()) : 0ul,
+				parent->flatCandidate ? 1u : 0u);
+		}
 		parent->dirty = true;
 		parent->suppressionReady = false;
 		parent->refreshRequested = false;
