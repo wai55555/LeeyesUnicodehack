@@ -20,6 +20,14 @@ bool gTreePathSearchVerifyFailed = false;
 namespace
 {
 
+// Leeyes talks to the ANSI APIs, so CP_ACP is the process code page. Resolve it
+// explicitly: with the UTF-8 system option (ACP 65001), WC_NO_BEST_FIT_CHARS is
+// not valid and every conversion would fail, disabling the tree batching.
+UINT TreePathCodePage(UINT codePage)
+{
+	return codePage == CP_ACP ? ::GetACP() : codePage;
+}
+
 bool CopyAnsiString(DWORD pointer, char* output, size_t capacity, size_t& length)
 {
 	length = 0;
@@ -90,6 +98,7 @@ bool EncodeTreePathExact(UINT codePage, const std::wstring& path, std::string& e
 	size_t maximumBytes)
 {
 	if( path.empty() || path.size() > INT_MAX || maximumBytes == 0 ) return false;
+	codePage = TreePathCodePage(codePage);
 	const bool utf8 = codePage == CP_UTF8;
 	BOOL usedDefault = FALSE;
 	const int bytes = ::WideCharToMultiByte(codePage, utf8 ? 0 : WC_NO_BEST_FIT_CHARS,
@@ -116,6 +125,7 @@ bool EncodeTreePathExact(UINT codePage, const std::wstring& path, std::string& e
 bool DecodeTreePathExact(UINT codePage, const char* path, size_t length, std::wstring& decoded)
 {
 	if( !path || length == 0 || length > INT_MAX ) return false;
+	codePage = TreePathCodePage(codePage);
 	if( memchr(path, '\0', length) ) return false;
 	const int units = ::MultiByteToWideChar(codePage, MB_ERR_INVALID_CHARS,
 		path, static_cast<int>(length), nullptr, 0);

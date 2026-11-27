@@ -500,6 +500,8 @@ bool TreeBatchRestoreOwnerEvent(DWORD site, DWORD continuation)
 	return true;
 }
 
+void TreeBatchRemoveFolderEventHooks();
+
 bool TreeBatchInstallFolderEventHooks()
 {
 	if( gFolderAddEventHookInstalled && gFolderDeleteEventHookInstalled ) return true;
@@ -515,7 +517,12 @@ bool TreeBatchInstallFolderEventHooks()
 	if( !gFolderDeleteEventHookInstalled )
 	{
 		if( !TreeBatchPatchOwnerEvent(deleteSite, reinterpret_cast<void*>(&TreeBatchDeleteEventHook),
-			gLeeyesTreeBatchDeleteEventContinuation) ) return false;
+			gLeeyesTreeBatchDeleteEventContinuation) )
+		{
+			// Never leave a half-installed hook patched into Leeyes.
+			TreeBatchRemoveFolderEventHooks();
+			return false;
+		}
 		gFolderDeleteEventCallSite = deleteSite;
 		gFolderDeleteEventHookInstalled = true;
 	}
@@ -1151,6 +1158,8 @@ void TreeBatchScheduleNext()
 		UINT current = 0;
 		if( parent.hasPendingFolderCandidate ) current = 1;
 		else if( !parent.baselineReady && !parent.dirty ) current = 100;
+		else if( !parent.dirty && gBatchMode == 2 && parent.committedState
+			&& !parent.committedTreeBaselineReady && parent.baselineCaptureAttempts < 20 ) current = 100;
 		else if( parent.dirty )
 		{
 			if( parent.retryAt > now ) current = static_cast<UINT>((std::min)(parent.retryAt - now, static_cast<ULONGLONG>(30000)));
@@ -1159,7 +1168,8 @@ void TreeBatchScheduleNext()
 		}
 		if( current && (!delay || current < delay) ) delay = current;
 	}
-	if( delay && !TreeBatchArmTimer(gTreeWindow, delay) )
+	// Mode 1 only observes and must never rewrite the tree from this path.
+	if( delay && !TreeBatchArmTimer(gTreeWindow, delay) && gBatchMode == 2 )
 		for( auto& parent : gParents ) if( parent.dirty )
 			TreeBatchEmergencyRescanOrDisable(parent, gTreeOwner, gTreeWindow, "schedule_timer_arm");
 }
@@ -2357,7 +2367,17 @@ bool TreeBatchProcessParent(ParentSession& parent, DWORD owner, HWND window, ULO
 					&& gWorkerReplacementAttempted[parent.workerSlot]);
 			if( parent.unavailable ) return false;
 			if( parent.worker->TerminationConfirmed() && replacementExhausted )
-				TreeBatchMarkUnavailable(parent, "worker_replacement_exhausted");
+			{
+				// Notifications suppressed for this parent may still be missing from
+				// the tree. Reconciling needs no watcher, so try one provider rescan
+				// before the parent is dropped. A flat session has no tree children
+				// to reconcile, so it can stop directly.
+				if( parent.flatCandidate )
+					TreeBatchMarkUnavailable(parent, "worker_replacement_exhausted");
+				else
+					TreeBatchEmergencyRescanOrDisable(parent, owner, window,
+						"worker_replacement_exhausted");
+			}
 			else TreeBatchRetry(parent, 30000, "worker_failed_no_replacement");
 		}
 		return false;
@@ -2374,6 +2394,29 @@ bool TreeBatchProcessParent(ParentSession& parent, DWORD owner, HWND window, ULO
 			else TreeBatchRetry(parent, 1000, "refresh_request");
 			return false;
 		}
+	}
+	// Leeyes applies the provider rescan result to the tree control after the
+	// call returns, so the tree can still lag the committed snapshot. Retry the
+	// baseline capture from the committed snapshot only, so it does not depend
+	// on a new watcher candidate or on further notifications.
+	if( !parent.dirty && gBatchMode == 2 && parent.committedState
+		&& !parent.committedTreeBaselineReady && parent.baselineCaptureAttempts < 20 )
+	{
+		++parent.baselineCaptureAttempts;
+		std::vector<TreeChildState> baseline;
+		UINT parentVisualState = 0;
+		if( TreeBatchCaptureCommittedTree(window, owner, parent, *parent.committedState,
+			baseline, parentVisualState) )
+		{
+			parent.committedTreeBaseline.swap(baseline);
+			parent.committedTreeBaselineReady = true;
+			parent.committedParentVisualState = parentVisualState;
+			TreeBatchLog("tree_batch_tree_baseline parent_hash=%08lX children=%u attempts=%u",
+				static_cast<unsigned long>(parent.nodeIdentity.pathHash),
+				static_cast<unsigned>(parent.committedTreeBaseline.size()),
+				parent.baselineCaptureAttempts);
+		}
+		else if( TreeBatchArmTimer(window, 100) ) return false;
 	}
 	WatchedSyncWorker::Candidate candidate;
 	if( !parent.worker->Take(candidate) )
@@ -2406,6 +2449,14 @@ bool TreeBatchProcessParent(ParentSession& parent, DWORD owner, HWND window, ULO
 		// one provider refresh to reconcile those notices, then stop batching
 		// this parent and let future notices use Leeyes' original path.
 		parent.suppressionReady = false;
+		if( gBatchMode == 1 )
+		{
+			// Comparison mode only: never refresh the tree from here.
+			bool current = false;
+			parent.worker->Release(candidate, current);
+			parent.refreshRequested = false;
+			return false;
+		}
 		if( !parent.baselineReady )
 		{
 			bool current = false;
@@ -2439,35 +2490,6 @@ bool TreeBatchProcessParent(ParentSession& parent, DWORD owner, HWND window, ULO
 		}
 		TreeBatchMarkUnavailable(parent, "reparse_stop_batching");
 		return true;
-	}
-	if( !parent.dirty && gBatchMode == 2 && parent.committedState
-		&& !parent.committedTreeBaselineReady && parent.baselineCaptureAttempts < 20 )
-	{
-		// Leeyes applies the provider rescan result to the tree control after the
-		// call returns, so the tree can still lag the committed snapshot here.
-		// Retry the baseline capture for a short bounded window instead of
-		// leaving the folder-replay/removal shortcuts permanently disabled.
-		++parent.baselineCaptureAttempts;
-		std::vector<TreeChildState> baseline;
-		UINT parentVisualState = 0;
-		if( TreeBatchCaptureCommittedTree(window, owner, parent, *parent.committedState,
-			baseline, parentVisualState) )
-		{
-			parent.committedTreeBaseline.swap(baseline);
-			parent.committedTreeBaselineReady = true;
-			parent.committedParentVisualState = parentVisualState;
-			TreeBatchLog("tree_batch_tree_baseline parent_hash=%08lX children=%u attempts=%u",
-				static_cast<unsigned long>(parent.nodeIdentity.pathHash),
-				static_cast<unsigned>(parent.committedTreeBaseline.size()),
-				parent.baselineCaptureAttempts);
-		}
-		else if( TreeBatchArmTimer(window, 100) )
-		{
-			bool current = false;
-			parent.worker->Release(candidate, current);
-			parent.refreshRequested = false;
-			return false;
-		}
 	}
 	if( !parent.dirty )
 	{
