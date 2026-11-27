@@ -17,7 +17,8 @@ public:
 	WatchedSnapshotProcess(const WatchedSnapshotProcess&) = delete;
 	WatchedSnapshotProcess& operator=(const WatchedSnapshotProcess&) = delete;
 
-	bool Start(const std::wstring& launcher, const std::wstring& path, DWORD& error, bool collectEntryIdentities = false)
+	bool Start(const std::wstring& launcher, const std::wstring& path, DWORD& error,
+		bool collectEntryIdentities = false, bool watchSubtree = true)
 	{
 		error = ERROR_SUCCESS;
 		if( process_.value )
@@ -57,7 +58,8 @@ public:
 			wchar_t controlNumber[32] = {};
 			swprintf_s(controlNumber, L"%llu", static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(rawControlRead)));
 			const std::wstring command = SnapshotWire::QuoteArgument(launcher) + L" --internal-state-watch " + number + L" " + SnapshotWire::QuoteArgument(path) + L" " + controlNumber
-				+ (collectEntryIdentities ? L" --entry-identities" : L"");
+				+ (collectEntryIdentities ? L" --entry-identities" : L"")
+				+ (!watchSubtree ? L" --watch-direct" : L"");
 			std::vector<wchar_t> mutableCommand(command.begin(), command.end()); mutableCommand.push_back(L'\0');
 			STARTUPINFOEXW startup = {}; startup.StartupInfo.cb = sizeof(startup); startup.lpAttributeList = attributes;
 			PROCESS_INFORMATION info = {};

@@ -128,6 +128,10 @@
     <ClCompile Include="leeyes_internal\trace_buffer.cpp" />
     <ClCompile Include="leeyes_internal\filelist_trace.cpp" />
     <ClCompile Include="leeyes_internal\file_move_batch.cpp" />
+    <ClCompile Include="leeyes_internal\tree_node_path.cpp" />
+    <ClCompile Include="leeyes_internal\tree_layout_guard.cpp" />
+    <ClCompile Include="leeyes_internal\tree_provider_rescan.cpp" />
+    <ClCompile Include="leeyes_internal\tree_notification_batch.cpp" />
     <ClCompile Include="leeyes_internal\delphi_bridge_x86.cpp" />
     <ClCompile Include="leeyes_internal\hook_runtime.cpp" />
     <ClCompile Include="leeyes_internal\ncodehook_bridge.cpp" />
@@ -143,6 +147,10 @@
     <ClInclude Include="leeyes_internal\trace_buffer.h" />
     <ClInclude Include="leeyes_internal\filelist_trace.h" />
     <ClInclude Include="leeyes_internal\file_move_batch.h" />
+    <ClInclude Include="leeyes_internal\tree_node_path.h" />
+    <ClInclude Include="leeyes_internal\tree_layout_guard.h" />
+    <ClInclude Include="leeyes_internal\tree_provider_rescan.h" />
+    <ClInclude Include="leeyes_internal\tree_notification_batch.h" />
     <ClInclude Include="leeyes_internal\delphi_bridge_x86.h" />
     <ClInclude Include="leeyes_internal\hook_runtime.h" />
     <ClInclude Include="leeyes_internal\ncodehook_bridge.h" />

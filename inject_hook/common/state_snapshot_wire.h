@@ -79,6 +79,7 @@ inline bool Decode(const std::vector<BYTE>& data, DirectorySnapshot::State& outp
 		if( e.name.find(L'\0') != std::wstring::npos || e.name.find_first_of(L"\\/") != std::wstring::npos
 			|| e.name == L"." || e.name == L".."
 			|| (!state.entries.empty() && !(state.entries.back().name < e.name)) ) return false;
+		if( e.attributes & FILE_ATTRIBUTE_REPARSE_POINT ) state.containsReparsePoint = true;
 		state.entries.push_back(std::move(e));
 	}
 	if( offset != data.size() ) return false;

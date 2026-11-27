@@ -2020,8 +2020,7 @@ int _tmain(int argc, _TCHAR* argv[])
 {
 	if( argc >= 2 && _tcsicmp(argv[1], TEXT("--internal-state-watch")) == 0 )
 	{
-		if( argc != 4 && argc != 5 && argc != 6 ) return 2;
-		if( argc == 6 && _tcscmp(argv[5], TEXT("--entry-identities")) != 0 ) return 2;
+		if( argc < 4 || argc > 7 ) return 2;
 		#if UNICODEHACK_SWEEP_DIAGNOSTICS
 		if( ::GetEnvironmentVariableW(L"LEYEES_STATE_WATCH_TEST_STALL", nullptr, 0) ) ::Sleep(INFINITE);
 		#endif
@@ -2034,8 +2033,18 @@ int _tmain(int argc, _TCHAR* argv[])
 			end = nullptr; control = _tcstoui64(argv[4], &end, 10);
 			if( !control || !end || *end || control > static_cast<unsigned __int64>(MAXDWORD) ) return 2;
 		}
+		bool collectEntryIdentities = false;
+		bool watchSubtree = true;
+		for( int i = 5; i < argc; ++i )
+		{
+			if( _tcscmp(argv[i], TEXT("--entry-identities")) == 0 && !collectEntryIdentities )
+				collectEntryIdentities = true;
+			else if( _tcscmp(argv[i], TEXT("--watch-direct")) == 0 && watchSubtree )
+				watchSubtree = false;
+			else return 2;
+		}
 		return WatchedSnapshotStream::RunChild(reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(value)), argv[3],
-			reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(control)), argc == 6);
+			reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(control)), collectEntryIdentities, watchSubtree);
 	}
 	if( argc >= 2 && _tcsicmp(argv[1], TEXT("--internal-state-snapshot")) == 0 )
 	{

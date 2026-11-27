@@ -125,14 +125,15 @@ inline void TraceRead(bool success, DWORD error, std::uint64_t generation, size_
 
 // This function may block on filesystem or pipe operations; execute it in a
 // process that the owner can terminate and whose exit it can verify.
-inline int RunChild(HANDLE pipe, const wchar_t* path, HANDLE control = nullptr, bool collectEntryIdentities = false)
+inline int RunChild(HANDLE pipe, const wchar_t* path, HANDLE control = nullptr,
+	bool collectEntryIdentities = false, bool watchSubtree = true)
 {
 	if( !pipe || pipe == INVALID_HANDLE_VALUE || ::GetFileType(pipe) != FILE_TYPE_PIPE || !path || !*path ) return 2;
 	DWORD error = ERROR_SUCCESS;
 	try
 	{
 		WatchedSnapshot watch;
-		if( !watch.Open(path, error, collectEntryIdentities) )
+		if( !watch.Open(path, error, collectEntryIdentities, watchSubtree) )
 		{ WriteFrame(pipe, Kind::Error, error ? error : ERROR_GEN_FAILURE, 0); return 3; }
 		std::uint64_t announced = watch.Generation();
 		if( !WriteFrame(pipe, Kind::Ready, 0, announced) ) return 4;

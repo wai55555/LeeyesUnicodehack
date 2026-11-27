@@ -4,6 +4,7 @@
 #include "file_move_batch.h"
 #include "target_resolver.h"
 #include "trace_buffer.h"
+#include "tree_notification_batch.h"
 
 #include <atomic>
 #include <stdio.h>
@@ -76,12 +77,23 @@ extern "C" __declspec(dllexport) void WINAPI InitializeLeeyesInternalHooks()
 		&& ReadInternalSetting("FileMoveDeleteBatch", 0) != 0;
 	const bool listAddSortBatchEnabled = batchEnabled
 		&& ReadInternalSetting("FileMoveAddSortBatch", 0) != 0;
+	// Stage 4 (folder-tree notification batching) is enabled by default.
+	// The legacy boolean keeps its meaning: an explicit FileMoveTreeBatch=0 still
+	// disables it, and an explicit FileMoveTreeBatchMode always wins.
+	int treeNotificationBatchMode = ReadInternalSetting("FileMoveTreeBatchMode", -1);
+	if( treeNotificationBatchMode < 0 )
+	{
+		const int legacyTreeBatch = ReadInternalSetting("FileMoveTreeBatch", -1);
+		treeNotificationBatchMode = legacyTreeBatch < 0 ? 2 : (legacyTreeBatch != 0 ? 2 : 0);
+	}
+	if( treeNotificationBatchMode < 0 || treeNotificationBatchMode > 2 ) treeNotificationBatchMode = 0;
+	const bool treeNotificationBatchEnabled = treeNotificationBatchMode != 0;
 	#if UNICODEHACK_PATH_DEBUG
 	const bool treeTimingEnabled = ReadInternalSetting("TreeTiming", 0) != 0;
 	#else
 	const bool treeTimingEnabled = false;
 	#endif
-	if( !traceEnabled && !batchEnabled && !treeTimingEnabled )
+	if( !traceEnabled && !batchEnabled && !treeTimingEnabled && !treeNotificationBatchEnabled )
 	{
 		StartupDiagnosticLog("internal_init_complete", "trace=0 batch=0 tree_timing=0");
 		gInitializationState.store(2, std::memory_order_release);
@@ -95,9 +107,25 @@ extern "C" __declspec(dllexport) void WINAPI InitializeLeeyesInternalHooks()
 		StartupDiagnosticLog(treeInstalled ? "tree_timing_installed" : "tree_timing_failed", "diagnostic only");
 	}
 	#endif
+	bool treeNotificationBatchInstalled = false;
+	if( treeNotificationBatchEnabled && treeTimingEnabled )
+		StartupDiagnosticLog("tree_batch_conflict", "TreeTiming diagnostic hook is active");
+	else if( treeNotificationBatchEnabled )
+	{
+		const int quietInterval = ReadInternalSetting("FileMoveTreeBatchQuietMs", 300);
+		treeNotificationBatchInstalled = quietInterval > 0
+			&& InstallTreeNotificationBatch(static_cast<unsigned>(quietInterval),
+				static_cast<unsigned>(treeNotificationBatchMode));
+		StartupDiagnosticLog(treeNotificationBatchInstalled ? "tree_batch_installed" : "tree_batch_failed",
+			treeNotificationBatchInstalled
+				? (treeNotificationBatchMode == 1 ? "shadow comparison active" : "state-based tree updates active")
+				: "original tree path remains active");
+	}
 	if( !traceEnabled && !batchEnabled )
 	{
-		StartupDiagnosticLog("internal_init_complete", "trace=0 batch=0 tree_timing=1");
+		const char* detail = treeNotificationBatchInstalled ? "trace=0 batch=0 tree_batch=1"
+			: (treeTimingEnabled ? "trace=0 batch=0 tree_timing=1" : "trace=0 batch=0 tree_batch=0");
+		StartupDiagnosticLog("internal_init_complete", detail);
 		gInitializationState.store(2, std::memory_order_release);
 		return;
 	}
@@ -137,8 +165,10 @@ extern "C" __declspec(dllexport) void WINAPI InitializeLeeyesInternalHooks()
 	}
 	if( !traceEnabled )
 	{
-		StartupDiagnosticLog("internal_init_complete", batchInstalled ? "batch=1" : "batch=0");
-		gInitializationState.store(batchInstalled ? 7 : 4, std::memory_order_release);
+		StartupDiagnosticLog("internal_init_complete", batchInstalled
+			? (treeNotificationBatchInstalled ? "batch=1 tree_batch=1" : "batch=1 tree_batch=0")
+			: (treeNotificationBatchInstalled ? "batch=0 tree_batch=1" : "batch=0 tree_batch=0"));
+		gInitializationState.store(batchInstalled || treeNotificationBatchInstalled ? 7 : 4, std::memory_order_release);
 		return;
 	}
 	// Layout functions are a separate diagnostic probe. They are disabled by
