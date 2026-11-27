@@ -241,6 +241,31 @@ std::wstring TreePathLeaf(const std::wstring& path)
 	return separator == std::wstring::npos ? path : path.substr(separator + 1);
 }
 
+}
+
+bool TreeItemTextReadback(TVITEMW& item, wchar_t* buffer, size_t capacity)
+{
+	if( !buffer || capacity < 2 ) return false;
+	// A null return means the control wrote into the array it was given; a
+	// non-null one may point at the control's own copy.
+	const wchar_t* reported = item.pszText ? item.pszText : buffer;
+	if( reported == buffer ) return true;
+	__try
+	{
+		// Bound the read by the caller's capacity: the length check the callers
+		// run afterwards rejects a label that fills the buffer, and it needs a
+		// terminated string to stay meaningful.
+		const size_t length = wcsnlen_s(reported, capacity);
+		if( length >= capacity ) return false;
+		memcpy(buffer, reported, (length + 1) * sizeof(wchar_t));
+	}
+	__except( EXCEPTION_EXECUTE_HANDLER ) { return false; }
+	return true;
+}
+
+namespace
+{
+
 bool TreeItemText(HWND window, HTREEITEM item, std::wstring& text)
 {
 	wchar_t label[1024] = {};
@@ -251,6 +276,7 @@ bool TreeItemText(HWND window, HTREEITEM item, std::wstring& text)
 	data.pszText = label;
 	data.cchTextMax = static_cast<int>(_countof(label));
 	if( !::SendMessageW(window, TVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&data)) ) return false;
+	if( !TreeItemTextReadback(data, label, _countof(label)) ) return false;
 	if( !label[0] || wcsnlen_s(label, _countof(label)) == _countof(label) - 1 || !data.lParam ) return false;
 	try { text.assign(label); }
 	catch( ... ) { return false; }

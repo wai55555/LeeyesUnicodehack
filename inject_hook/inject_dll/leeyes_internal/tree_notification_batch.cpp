@@ -664,6 +664,7 @@ bool TreeBatchCaptureVisibleSubtree(HWND window, const ParentSession& parent, st
 				data.pszText = text;
 				data.cchTextMax = _countof(text);
 				if( !::SendMessageW(window, TVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&data)) ) return false;
+				if( !TreeItemTextReadback(data, text, _countof(text)) ) return false;
 				if( text[0] == L'\0' || wcsnlen_s(text, _countof(text)) == _countof(text) - 1
 					|| !data.lParam ) return false;
 				TreeChildState child;
@@ -1403,6 +1404,7 @@ bool TreeBatchCanSkipRemovalRescan(HWND window, DWORD owner, const ParentSession
 			item.pszText = label;
 			item.cchTextMax = static_cast<int>(_countof(label));
 			if( !::SendMessageW(window, TVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&item))
+				|| !TreeItemTextReadback(item, label, _countof(label))
 				|| !item.lParam || !label[0] ) return false;
 			const auto found = std::lower_bound(currentState.entries.begin(), currentState.entries.end(), label,
 				[](const DirectorySnapshot::Entry& entry, const wchar_t* name) { return entry.name < name; });
@@ -1535,6 +1537,7 @@ bool TreeBatchCaptureCommittedTree(HWND window, DWORD owner, const ParentSession
 			item.pszText = label;
 			item.cchTextMax = static_cast<int>(_countof(label));
 			if( !::SendMessageW(window, TVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&item))
+				|| !TreeItemTextReadback(item, label, _countof(label))
 				|| !item.lParam || !label[0] || wcsnlen_s(label, _countof(label)) == _countof(label) - 1 )
 				return fail("child_item");
 			const std::wstring name(label);
@@ -1792,6 +1795,7 @@ bool TreeBatchBuildFolderActions(HWND window, DWORD owner, ParentSession& parent
 			item.pszText = label;
 			item.cchTextMax = static_cast<int>(_countof(label));
 			if( !::SendMessageW(window, TVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&item))
+				|| !TreeItemTextReadback(item, label, _countof(label))
 				|| !item.lParam || !label[0] || wcsnlen_s(label, _countof(label)) == _countof(label) - 1 )
 				return fail("child_item");
 			const std::wstring name(label);
@@ -1929,6 +1933,7 @@ bool TreeBatchFindDirectFolder(HWND window, const ParentSession& parent, const F
 		item.pszText = label;
 		item.cchTextMax = static_cast<int>(_countof(label));
 		if( !::SendMessageW(window, TVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&item))
+			|| !TreeItemTextReadback(item, label, _countof(label))
 			|| !item.lParam || !label[0] || wcsnlen_s(label, _countof(label)) == _countof(label) - 1 ) return false;
 		if( ::CompareStringOrdinal(label, -1, action.name.c_str(), static_cast<int>(action.name.size()), TRUE)
 			== CSTR_EQUAL )
@@ -2010,6 +2015,7 @@ bool TreeBatchVerifyFolderTree(HWND window, DWORD owner, const ParentSession& pa
 			item.pszText = label;
 			item.cchTextMax = static_cast<int>(_countof(label));
 			if( !::SendMessageW(window, TVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&item))
+				|| !TreeItemTextReadback(item, label, _countof(label))
 				|| !item.lParam || !label[0] || wcsnlen_s(label, _countof(label)) == _countof(label) - 1 )
 				return fail("child_item");
 			const std::wstring name(label);

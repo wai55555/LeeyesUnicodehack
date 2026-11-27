@@ -39,6 +39,12 @@ bool FindExpandedTreeNodeByPath(HWND window, UINT codePage, const std::wstring& 
 bool FindTreeNodeByPathComponents(HWND window, UINT codePage, const std::wstring& path,
 	DWORD timeBudgetMs, unsigned maximumNodes, HTREEITEM& item, DWORD& node,
 	bool& expandedState);
+// TVM_GETITEMW may report the label by pointing the returned pszText at the
+// control's own buffer instead of copying it into the array the caller supplied.
+// Read the reported label back into that array so every caller keeps one read
+// path and one length rule; a label that does not fit is rejected instead of
+// being truncated.
+bool TreeItemTextReadback(TVITEMW& item, wchar_t* buffer, size_t capacity);
 bool TreeOwnerContainsWindow(DWORD owner, HWND window);
 bool FindTreeViewWindow(DWORD owner, DWORD threadId, HWND& window);
 
