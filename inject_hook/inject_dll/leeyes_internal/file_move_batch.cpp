@@ -4017,6 +4017,21 @@ void ConfigureListAddSortBatch(bool enabled)
 	gListAddSortBatchEnabled = enabled;
 }
 
+bool GetCurrentListDirectory(std::wstring& directory)
+{
+	void* owner = gListDeleteBatch.owner;
+	HWND window = gListDeleteBatch.window;
+	if( !owner || !window || !::IsWindow(window)
+		|| !DispatchOwnerContainsListWindow(owner, window) ) return false;
+	char currentAnsi[kScopePathCapacity] = {};
+	std::wstring current;
+	if( !ReadOwnerDirectory(owner, currentAnsi, _countof(currentAnsi))
+		|| !ExactAnsiDirectoryToWide(currentAnsi, current)
+		|| current != gListDeleteBatch.target ) return false;
+	directory.swap(current);
+	return true;
+}
+
 void ResetFileMoveBatchState()
 {
 	gDrainState = DrainState();

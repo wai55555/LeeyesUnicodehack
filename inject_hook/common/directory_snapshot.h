@@ -33,6 +33,9 @@ struct State
 	DWORD volume = 0;
 	ULONGLONG directoryId = 0;
 	std::vector<Entry> entries;
+	// Derived from entry attributes while the snapshot is read/decoded so UI
+	// callers do not need to rescan a large entry vector to reject reparse data.
+	bool containsReparsePoint = false;
 };
 enum class ChangeKind { Added, Removed, MetadataChanged };
 struct Change
@@ -175,6 +178,7 @@ inline bool Read(const std::wstring& path, State& output, DWORD& error,
 			if( next.entries.size() >= maximumEntries ) { error = ERROR_BUFFER_OVERFLOW; return false; }
 			Entry item;
 			item.name = data.cFileName; item.attributes = data.dwFileAttributes;
+			if( item.attributes & FILE_ATTRIBUTE_REPARSE_POINT ) next.containsReparsePoint = true;
 			item.size = Combine(data.nFileSizeHigh, data.nFileSizeLow);
 			item.created = Combine(data.ftCreationTime.dwHighDateTime, data.ftCreationTime.dwLowDateTime);
 			item.written = Combine(data.ftLastWriteTime.dwHighDateTime, data.ftLastWriteTime.dwLowDateTime);

@@ -14,7 +14,8 @@ public:
 	DirectoryChangeWatcher(const DirectoryChangeWatcher&) = delete;
 	DirectoryChangeWatcher& operator=(const DirectoryChangeWatcher&) = delete;
 
-	bool Open(const std::wstring& path, DWORD& error)
+	// subtree=false is appropriate when snapshots represent only direct entries.
+	bool Open(const std::wstring& path, DWORD& error, bool subtree = true)
 	{
 		Close(); error = ERROR_SUCCESS;
 		if( !event_.value || path.empty() ) { error = event_.value ? ERROR_INVALID_NAME : ERROR_NOT_ENOUGH_MEMORY; return false; }
@@ -24,7 +25,8 @@ public:
 		if( directory_ == INVALID_HANDLE_VALUE ) { error = ::GetLastError(); return false; }
 		ULONGLONG write = 0;
 		if( !DirectorySnapshot::Identity(directory_, volume_, id_, write, error) ) { Close(); return false; }
-		try { path_ = path; } catch( ... ) { error = ERROR_NOT_ENOUGH_MEMORY; Close(); return false; }
+		try { path_ = path; subtree_ = subtree; }
+		catch( ... ) { error = ERROR_NOT_ENOUGH_MEMORY; Close(); return false; }
 		if( !Arm(error) ) { Close(); return false; }
 		return true;
 	}
@@ -79,7 +81,7 @@ public:
 			}
 			::CloseHandle(directory_); directory_ = INVALID_HANDLE_VALUE;
 		}
-		armed_ = false; path_.clear(); volume_ = 0; id_ = 0;
+		armed_ = false; path_.clear(); volume_ = 0; id_ = 0; subtree_ = true;
 	}
 private:
 	bool Arm(DWORD& error)
@@ -89,7 +91,8 @@ private:
 		const DWORD filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME
 			| FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE
 			| FILE_NOTIFY_CHANGE_CREATION | FILE_NOTIFY_CHANGE_SECURITY;
-		if( !::ReadDirectoryChangesW(directory_, buffer_, sizeof(buffer_), TRUE, filter, nullptr, &overlapped_, nullptr) )
+		if( !::ReadDirectoryChangesW(directory_, buffer_, sizeof(buffer_), subtree_ ? TRUE : FALSE,
+			filter, nullptr, &overlapped_, nullptr) )
 		{ error = ::GetLastError(); return false; }
 		armed_ = true; return true;
 	}
@@ -101,4 +104,5 @@ private:
 	DWORD volume_ = 0;
 	ULONGLONG id_ = 0;
 	bool armed_ = false;
+	bool subtree_ = true;
 };

@@ -21,8 +21,10 @@ class WatchedSyncWorker
 {
 public:
 	using Candidate = WatchedSyncCoordinator::Candidate;
-	explicit WatchedSyncWorker(std::wstring launcher, DWORD heartbeatTimeoutMs = 5000, bool collectEntryIdentities = false)
-		: launcher_(std::move(launcher)), heartbeatTimeoutMs_(heartbeatTimeoutMs), collectEntryIdentities_(collectEntryIdentities) {}
+	explicit WatchedSyncWorker(std::wstring launcher, DWORD heartbeatTimeoutMs = 5000,
+		bool collectEntryIdentities = false, bool watchSubtree = true)
+		: launcher_(std::move(launcher)), heartbeatTimeoutMs_(heartbeatTimeoutMs),
+		collectEntryIdentities_(collectEntryIdentities), watchSubtree_(watchSubtree) {}
 	~WatchedSyncWorker() { Stop(); }
 	WatchedSyncWorker(const WatchedSyncWorker&) = delete;
 	WatchedSyncWorker& operator=(const WatchedSyncWorker&) = delete;
@@ -63,6 +65,9 @@ public:
 	bool Release(const Candidate& candidate, bool& current) { return coordinator_.Release(candidate, current); }
 	DWORD Error() { return coordinator_.Error(); }
 	bool Failed() const { return failed_.load(); }
+	// True only after the supervised child has been confirmed stopped. A caller
+	// must not create a replacement while a failed worker still owns a live child.
+	bool TerminationConfirmed() const { return terminationConfirmed_.load(); }
 	unsigned SnapshotFrames() const { return snapshotFrames_.load(); }
 	unsigned DirtyFrames() const { return dirtyFrames_.load(); }
 	unsigned ChildStarts() const { return childStarts_.load(); }
@@ -78,6 +83,7 @@ private:
 			coordinator_.Disconnected(targetEpoch_, ERROR_GEN_FAILURE);
 		}
 		while( !process.Stop(100) ) ::Sleep(50);
+		terminationConfirmed_.store(true);
 	}
 	void RunLoop(WatchedSnapshotProcess& process)
 	{
@@ -98,7 +104,7 @@ private:
 				if( !path.empty() )
 				{
 					DWORD error = ERROR_SUCCESS;
-					if( !process.Start(launcher_, path, error, collectEntryIdentities_) )
+					if( !process.Start(launcher_, path, error, collectEntryIdentities_, watchSubtree_) )
 					{ coordinator_.Disconnected(epoch, error); failedTarget = true; retryAt = ::GetTickCount64() + 1000; }
 					else { ++childStarts_; active = true; lastFrame = ::GetTickCount64(); }
 				}
@@ -172,11 +178,12 @@ private:
 	std::wstring launcher_;
 	DWORD heartbeatTimeoutMs_;
 	bool collectEntryIdentities_;
+	bool watchSubtree_;
 	WatchedSyncCoordinator coordinator_;
 	std::mutex targetMutex_;
 	std::wstring targetPath_;
 	std::uint64_t targetEpoch_ = 0, requestSerial_ = 0, pendingRequest_ = 0;
-	std::atomic<bool> stopped_{false}, failed_{false};
+	std::atomic<bool> stopped_{false}, failed_{false}, terminationConfirmed_{false};
 	std::atomic<unsigned> snapshotFrames_{0}, dirtyFrames_{0}, childStarts_{0};
 	std::thread thread_;
 };

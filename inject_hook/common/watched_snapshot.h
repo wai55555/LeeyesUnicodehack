@@ -16,10 +16,11 @@ public:
 		std::uint64_t generation = 0; DirectorySnapshot::State state;
 		bool hasEntryIdentities = false; DirectoryEntryIdentity::State entryIdentities;
 	};
-	bool Open(const std::wstring& path, DWORD& error, bool collectEntryIdentities = false)
+	bool Open(const std::wstring& path, DWORD& error, bool collectEntryIdentities = false,
+		bool watchSubtree = true)
 	{
 		healthy_ = false; collectEntryIdentities_ = false; path_.clear(); watcher_.Close();
-		if( !Bump(error) || !watcher_.Open(path, error) ) return false;
+		if( !Bump(error) || !watcher_.Open(path, error, watchSubtree) ) return false;
 		try { path_ = path; } catch( ... ) { watcher_.Close(); error = ERROR_NOT_ENOUGH_MEMORY; return false; }
 		collectEntryIdentities_ = collectEntryIdentities; healthy_ = true; return true;
 	}
