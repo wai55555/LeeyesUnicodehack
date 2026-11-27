@@ -37,6 +37,8 @@ extern HMODULE gInjectedModule;
 namespace LeeyesInternal
 {
 extern unsigned long long gTreePathSearchVisited;
+extern unsigned long long gTreePathSearchKnownPaths;
+extern unsigned long long gTreePathSearchBestPrefix;
 extern unsigned long long gTreePathSearchPathNodes;
 extern unsigned long long gTreePathSearchItemFailures;
 extern bool gTreePathSearchVerifyFailed;
@@ -185,6 +187,13 @@ struct ParentSession
 	bool committedTreeBaselineReady = false;
 	bool folderActionSuppressed = false;
 	bool forceProviderRescan = false;
+	// Flat-folder mode: Leeyes keeps a leaf directory node collapsed forever, so
+	// an expanded-parent session can never attach. If the watcher proves the
+	// folder has no subdirectories, only the action 2 inner search is suppressed
+	// and no provider rescan is needed because the tree has no child nodes.
+	bool flatCandidate = false;
+	bool flatReady = false;
+	ULONGLONG flatCommits = 0;
 	// Verification counters (see TreeBatchLog).
 	ULONGLONG suppressedAction2 = 0;
 	ULONGLONG suppressedAdd = 0;
@@ -531,8 +540,10 @@ void TreeBatchRemoveFolderEventHooks()
 	}
 }
 
-bool TreeBatchParentCurrent(HWND window, DWORD owner, const ParentSession& parent, bool verifyOwner)
+bool TreeBatchParentState(HWND window, DWORD owner, const ParentSession& parent, bool verifyOwner,
+	bool& expanded)
 {
+	expanded = false;
 	if( !window || !::IsWindow(window) || !owner
 		|| (verifyOwner && !TreeOwnerContainsWindow(owner, window))
 		|| !parent.item || !parent.node ) return false;
@@ -541,11 +552,33 @@ bool TreeBatchParentCurrent(HWND window, DWORD owner, const ParentSession& paren
 	item.stateMask = TVIS_EXPANDED;
 	item.hItem = parent.item;
 	if( !::SendMessageW(window, TVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&item))
-		|| static_cast<DWORD>(item.lParam) != parent.node || !(item.state & TVIS_EXPANDED) ) return false;
+		|| static_cast<DWORD>(item.lParam) != parent.node ) return false;
 	TreeNodePathIdentity observed = {};
-	return ReadTreeNodePathIdentity(parent.node, observed, true)
-		&& TreeBatchNodeIdentityEqual(observed, parent.nodeIdentity)
-		&& TreeBatchPathAcceptable(observed, parent.path);
+	if( !ReadTreeNodePathIdentity(parent.node, observed, true)
+		|| !TreeBatchNodeIdentityEqual(observed, parent.nodeIdentity)
+		|| !TreeBatchPathAcceptable(observed, parent.path) ) return false;
+	expanded = (item.state & TVIS_EXPANDED) != 0;
+	return true;
+}
+
+bool TreeBatchParentCurrent(HWND window, DWORD owner, const ParentSession& parent, bool verifyOwner)
+{
+	bool expanded = false;
+	return TreeBatchParentState(window, owner, parent, verifyOwner, expanded) && expanded;
+}
+
+bool TreeBatchParentFlatCurrent(HWND window, DWORD owner, const ParentSession& parent, bool verifyOwner)
+{
+	bool expanded = false;
+	return TreeBatchParentState(window, owner, parent, verifyOwner, expanded) && !expanded;
+}
+
+// Identity check used by the notification hooks: a flat session is valid while
+// the node stays collapsed, a normal session while it stays expanded.
+bool TreeBatchParentUsable(HWND window, DWORD owner, const ParentSession& parent, bool verifyOwner)
+{
+	if( parent.flatCandidate ) return TreeBatchParentFlatCurrent(window, owner, parent, verifyOwner);
+	return TreeBatchParentCurrent(window, owner, parent, verifyOwner);
 }
 
 bool TreeBatchParentVisualState(HWND window, const ParentSession& parent, UINT& visualState)
@@ -908,8 +941,32 @@ bool TreeBatchAttachParent(DWORD owner, HWND window, const std::wstring& path)
 	// checks keep the 8ms comparison budget, but the attach search must be able
 	// to reach a parent that sits below a large expanded drive tree. It is
 	// bounded by time and node count, and only runs while a slot is still free.
+	bool flatCandidate = false;
+	bool nodeExpanded = false;
 	const ULONGLONG searchStarted = ::GetTickCount64();
-	if( !FindExpandedTreeNodeByPath(window, CP_ACP, path, 50, 100000, item, node) )
+	bool found = FindExpandedTreeNodeByPath(window, CP_ACP, path, 50, 100000, item, node);
+	if( !found && gBatchMode == 2
+		&& FindExpandedTreeNodeByPath(window, CP_ACP, path, 50, 100000, item, node, true, &nodeExpanded) )
+	{
+		// A leaf directory node never becomes expanded in Leeyes. Accept it as a
+		// flat candidate; the first snapshot decides whether the folder really has
+		// no subdirectories and can therefore be batched without a rescan.
+		flatCandidate = !nodeExpanded;
+		found = true;
+	}
+	if( !found )
+	{
+		// Some nodes have no cached path yet even though they are present. Locate
+		// them through the closest ancestor with a known path and exact child names.
+		bool componentExpanded = false;
+		if( FindTreeNodeByPathComponents(window, CP_ACP, path, 50, 100000, item, node,
+			componentExpanded) )
+		{
+			found = true;
+			flatCandidate = !componentExpanded;
+		}
+	}
+	if( !found )
 	{
 		std::string probeEncoded;
 		const bool encodeOk = EncodeTreePathExact(CP_ACP, path, probeEncoded, kMaximumPathBytes);
@@ -936,12 +993,21 @@ bool TreeBatchAttachParent(DWORD owner, HWND window, const std::wstring& path)
 			gTreePathSearchVisited, gTreePathSearchPathNodes,
 			gTreePathSearchItemFailures, gTreePathSearchVerifyFailed ? 1u : 0u,
 			::GetTickCount64());
+		TreeBatchLog("tree_batch_attach_component_failed parent_key=%08lX known_paths=%llu best_prefix=%llu",
+			static_cast<unsigned long>(pathKey), gTreePathSearchKnownPaths, gTreePathSearchBestPrefix);
 		return fail("node_not_found");
 	}
 	ParentSession parent;
 	parent.path = path;
 	parent.item = item;
 	parent.node = node;
+	parent.flatCandidate = flatCandidate;
+	if( flatCandidate )
+	{
+		parent.dirty = true;
+		parent.refreshRequested = false;
+		parent.quietDeadline = 0;
+	}
 	// Reusing an unavailable slot means earlier notices may have been suppressed
 	// against a session whose node or watcher could no longer be trusted. Keep
 	// forwarding notifications and require a fresh provider rescan before this
@@ -1235,6 +1301,40 @@ void TreeBatchRememberState(ParentSession& parent, DirectorySnapshot::State&& st
 		parent.cycleAdd, parent.cycleDelete, parent.suppressedAction2, parent.suppressedAdd,
 		parent.suppressedDelete, parent.noRescanCount, parent.rescanCount, parent.rescanLastUs,
 		static_cast<unsigned long>(parent.lastShellError));
+	parent.cycleAction2 = 0;
+	parent.cycleAdd = 0;
+	parent.cycleDelete = 0;
+}
+
+void TreeBatchRememberFlatState(ParentSession& parent, DirectorySnapshot::State&& state)
+{
+	parent.volume = state.volume;
+	parent.directoryId = state.directoryId;
+	try { parent.committedState.reset(new DirectorySnapshot::State(std::move(state))); }
+	catch( ... ) { parent.committedState.reset(); }
+	parent.committedTreeBaseline.clear();
+	parent.committedTreeBaselineReady = false;
+	parent.committedParentVisualState = 0;
+	parent.baselineReady = true;
+	parent.suppressionReady = true;
+	parent.flatReady = true;
+	parent.dirty = false;
+	parent.refreshRequested = false;
+	parent.retryDelayMs = 0;
+	parent.retryCount = 0;
+	parent.retryAt = 0;
+	parent.quietDeadline = 0;
+	parent.folderActionSuppressed = false;
+	parent.forceProviderRescan = false;
+	parent.baselineCaptureAttempts = 0;
+	TreeBatchClearPendingFolderState(parent);
+	++parent.commitCount;
+	++parent.flatCommits;
+	TreeBatchLog("tree_batch_flat_commit parent_key=%08lX parent_hash=%08lX commit=%llu entries=%u cycle_action2=%llu suppressed_total=%llu norescan=%llu rescans=%llu",
+		static_cast<unsigned long>(TreeBatchPathKey(parent.path)),
+		static_cast<unsigned long>(parent.nodeIdentity.pathHash), parent.commitCount,
+		static_cast<unsigned>(parent.committedState ? parent.committedState->entries.size() : 0),
+		parent.cycleAction2, parent.suppressedAction2, parent.noRescanCount, parent.rescanCount);
 	parent.cycleAction2 = 0;
 	parent.cycleAdd = 0;
 	parent.cycleDelete = 0;
@@ -2175,6 +2275,76 @@ void TreeBatchEmergencyRescanOrDisable(ParentSession& parent, DWORD owner, HWND 
 	TreeBatchMarkUnavailable(parent, reason);
 }
 
+// Flat-folder session: the parent node is a collapsed leaf and the watcher has
+// to prove that the folder has no subdirectories. Only the action 2 inner search
+// is withheld; the tree has no child nodes to reconcile, so no provider rescan
+// is needed and the first snapshot is accepted without waiting for quiet.
+bool TreeBatchProcessFlatParent(ParentSession& parent, DWORD owner, HWND window)
+{
+	bool expanded = false;
+	if( !TreeBatchParentState(window, owner, parent, true, expanded) )
+	{
+		TreeBatchMarkUnavailable(parent, "flat_parent_identity");
+		return true;
+	}
+	if( expanded )
+	{
+		// The user expanded the node, so file/archive child nodes may exist now.
+		TreeBatchMarkUnavailable(parent, "flat_parent_expanded");
+		return true;
+	}
+	if( parent.dirty && !parent.refreshRequested )
+	{
+		if( parent.worker->RequestRefresh() ) parent.refreshRequested = true;
+		else TreeBatchRetry(parent, 500, "flat_refresh");
+		return true;
+	}
+	WatchedSyncWorker::Candidate candidate;
+	if( !parent.worker->Take(candidate) )
+	{
+		if( parent.dirty && parent.worker->Error() != ERROR_SUCCESS )
+			TreeBatchRetry(parent, 500, "flat_snapshot");
+		return true;
+	}
+	if( !parent.worker->CanApply(candidate) )
+	{
+		bool current = false;
+		parent.worker->Release(candidate, current);
+		parent.refreshRequested = false;
+		return true;
+	}
+	if( parent.baselineReady && (candidate.state.volume != parent.volume
+		|| candidate.state.directoryId != parent.directoryId) )
+	{
+		bool current = false;
+		parent.worker->Release(candidate, current);
+		TreeBatchMarkUnavailable(parent, "flat_directory_identity");
+		return true;
+	}
+	if( !TreeBatchSnapshotSupported(candidate.state) )
+	{
+		bool current = false;
+		parent.worker->Release(candidate, current);
+		TreeBatchMarkUnavailable(parent, "flat_snapshot_unsupported");
+		return true;
+	}
+	for( const auto& entry : candidate.state.entries )
+		if( entry.attributes & FILE_ATTRIBUTE_DIRECTORY )
+		{
+			bool current = false;
+			parent.worker->Release(candidate, current);
+			TreeBatchMarkUnavailable(parent, "flat_has_directories");
+			return true;
+		}
+	if( !parent.worker->Finish(candidate) )
+	{
+		TreeBatchRetry(parent, 100, "flat_finish");
+		return true;
+	}
+	TreeBatchRememberFlatState(parent, std::move(candidate.state));
+	return true;
+}
+
 bool TreeBatchProcessParent(ParentSession& parent, DWORD owner, HWND window, ULONGLONG now)
 {
 	if( parent.unavailable || !parent.worker ) return false;
@@ -2192,6 +2362,7 @@ bool TreeBatchProcessParent(ParentSession& parent, DWORD owner, HWND window, ULO
 		}
 		return false;
 	}
+	if( parent.flatCandidate ) return TreeBatchProcessFlatParent(parent, owner, window);
 	if( !TreeBatchParentCurrent(window, owner, parent, true) )
 	{ TreeBatchMarkUnavailable(parent, "parent_identity"); return false; }
 	if( parent.dirty )
@@ -2519,7 +2690,7 @@ bool TreeBatchShouldSuppress(DWORD pathPointer, DWORD frame, DWORD caller)
 		TreeBatchAttachParent(owner, window, parentPath);
 		return false;
 	}
-	if( parent->baselineReady && !TreeBatchParentCurrent(window, owner, *parent, false) )
+	if( parent->baselineReady && !TreeBatchParentUsable(window, owner, *parent, false) )
 	{
 		TreeBatchMarkUnavailable(*parent, "hook_parent_identity");
 		return false;
@@ -2593,7 +2764,7 @@ DWORD TreeBatchShouldSuppressFolderSearch(DWORD pathPointer, DWORD frame, DWORD 
 		TreeBatchAttachParent(owner, window, parentPath);
 		return 0;
 	}
-	if( parent->baselineReady && !TreeBatchParentCurrent(window, owner, *parent, false) )
+	if( parent->baselineReady && !TreeBatchParentUsable(window, owner, *parent, false) )
 	{
 		TreeBatchMarkUnavailable(*parent, "hook_folder_parent_identity");
 		return 0;
@@ -2621,6 +2792,10 @@ DWORD TreeBatchShouldSuppressFolderSearch(DWORD pathPointer, DWORD frame, DWORD 
 		return 0;
 	}
 	if( gBatchMode != 2 ) return 0;
+	// A flat session only withholds the action 2 inner search. Folder additions
+	// and removals would change the directory set (and end the flat condition),
+	// so they keep using Leeyes' original path.
+	if( parent->flatCandidate ) return 0;
 	if( action == 3 ) { ++parent->cycleAdd; ++parent->suppressedAdd; }
 	else { ++parent->cycleDelete; ++parent->suppressedDelete; }
 	// The state snapshot supplies names and order; retain only this bounded

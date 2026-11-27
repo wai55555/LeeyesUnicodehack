@@ -11,6 +11,8 @@ namespace LeeyesInternal
 {
 // Latest path-search shape, for diagnostics only.
 unsigned long long gTreePathSearchVisited = 0;
+unsigned long long gTreePathSearchKnownPaths = 0;
+unsigned long long gTreePathSearchBestPrefix = 0;
 unsigned long long gTreePathSearchPathNodes = 0;
 unsigned long long gTreePathSearchItemFailures = 0;
 bool gTreePathSearchVerifyFailed = false;
@@ -212,9 +214,178 @@ bool FindTreeViewWindow(DWORD owner, DWORD threadId, HWND& window)
 	return ::IsWindow(window) != FALSE;
 }
 
-bool FindExpandedTreeNodeByPath(HWND window, UINT codePage, const std::wstring& path,
-	DWORD timeBudgetMs, unsigned maximumNodes, HTREEITEM& item, DWORD& node)
+namespace
 {
+
+bool TreePathPrefix(const std::wstring& prefix, const std::wstring& path)
+{
+	if( prefix.empty() || path.size() <= prefix.size() ) return false;
+	if( ::CompareStringOrdinal(prefix.data(), static_cast<int>(prefix.size()),
+		path.data(), static_cast<int>(prefix.size()), TRUE) != CSTR_EQUAL ) return false;
+	return path[prefix.size()] == L'\\' || path[prefix.size()] == L'/';
+}
+
+std::wstring TreePathLeaf(const std::wstring& path)
+{
+	const size_t separator = path.find_last_of(L"\\/");
+	return separator == std::wstring::npos ? path : path.substr(separator + 1);
+}
+
+bool TreeItemText(HWND window, HTREEITEM item, std::wstring& text)
+{
+	wchar_t label[1024] = {};
+	TVITEMW data = {};
+	data.mask = TVIF_TEXT | TVIF_PARAM | TVIF_STATE;
+	data.stateMask = TVIS_EXPANDED;
+	data.hItem = item;
+	data.pszText = label;
+	data.cchTextMax = static_cast<int>(_countof(label));
+	if( !::SendMessageW(window, TVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&data)) ) return false;
+	if( !label[0] || wcsnlen_s(label, _countof(label)) == _countof(label) - 1 || !data.lParam ) return false;
+	try { text.assign(label); }
+	catch( ... ) { return false; }
+	return true;
+}
+
+}
+
+bool FindTreeNodeByPathComponents(HWND window, UINT codePage, const std::wstring& path,
+	DWORD timeBudgetMs, unsigned maximumNodes, HTREEITEM& item, DWORD& node,
+	bool& expandedState)
+{
+	item = nullptr;
+	node = 0;
+	expandedState = false;
+	if( !window || !::IsWindow(window) || !timeBudgetMs || !maximumNodes || path.empty() ) return false;
+	try
+	{
+		// 1) Find the closest ancestor whose cached path is a prefix of the target.
+		gTreePathSearchKnownPaths = 0;
+		gTreePathSearchBestPrefix = 0;
+		std::wstring bestPrefix;
+		HTREEITEM bestItem = nullptr;
+		DWORD bestNode = 0;
+		std::vector<HTREEITEM> pending;
+		HTREEITEM root = reinterpret_cast<HTREEITEM>(::SendMessageW(window, TVM_GETNEXTITEM, TVGN_ROOT, 0));
+		if( !root ) return false;
+		pending.push_back(root);
+		const ULONGLONG deadline = ::GetTickCount64() + timeBudgetMs;
+		unsigned visited = 0;
+		while( !pending.empty() )
+		{
+			if( ++visited > maximumNodes || ::GetTickCount64() >= deadline ) return false;
+			const HTREEITEM current = pending.back();
+			pending.pop_back();
+			TVITEMW state = {};
+			state.mask = TVIF_PARAM | TVIF_STATE;
+			state.stateMask = TVIS_EXPANDED;
+			state.hItem = current;
+			if( !::SendMessageW(window, TVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&state)) ) return false;
+			if( state.lParam )
+			{
+				TreeNodePathIdentity identity = {};
+				if( ReadTreeNodePathIdentity(static_cast<DWORD>(state.lParam), identity, true)
+					&& identity.pathKnown )
+				{
+					std::wstring decoded;
+					if( ReadDelphiAnsiTreePath(CP_ACP, identity.cachedPath, decoded) )
+					{
+						++gTreePathSearchKnownPaths;
+						if( decoded.size() == path.size()
+							&& ::CompareStringOrdinal(decoded.data(), static_cast<int>(decoded.size()),
+								path.data(), static_cast<int>(path.size()), TRUE) == CSTR_EQUAL )
+						{
+							item = current;
+							node = static_cast<DWORD>(state.lParam);
+							expandedState = (state.state & TVIS_EXPANDED) != 0;
+							return true;
+						}
+						if( decoded.size() < path.size() && decoded.size() > bestPrefix.size()
+							&& TreePathPrefix(decoded, path) )
+						{
+							bestPrefix.swap(decoded);
+							bestItem = current;
+							bestNode = static_cast<DWORD>(state.lParam);
+							gTreePathSearchBestPrefix = static_cast<unsigned long long>(bestPrefix.size());
+						}
+					}
+				}
+			}
+			HTREEITEM sibling = reinterpret_cast<HTREEITEM>(::SendMessageW(window,
+				TVM_GETNEXTITEM, TVGN_NEXT, reinterpret_cast<LPARAM>(current)));
+			if( sibling ) pending.push_back(sibling);
+			HTREEITEM child = reinterpret_cast<HTREEITEM>(::SendMessageW(window,
+				TVM_GETNEXTITEM, TVGN_CHILD, reinterpret_cast<LPARAM>(current)));
+			if( child ) pending.push_back(child);
+		}
+		if( !bestItem ) return false;
+
+		// 2) Descend through the remaining components by exact child item names.
+		std::wstring remaining = path.substr(bestPrefix.size());
+		size_t offset = 0;
+		while( offset < remaining.size() && (remaining[offset] == L'\\' || remaining[offset] == L'/') ) ++offset;
+		HTREEITEM current = bestItem;
+		DWORD currentNode = bestNode;
+		while( offset < remaining.size() )
+		{
+			const size_t end = remaining.find_first_of(L"\\/", offset);
+			const std::wstring component = remaining.substr(offset, end == std::wstring::npos ? std::wstring::npos : end - offset);
+			if( component.empty() ) break;
+			HTREEITEM match = nullptr;
+			DWORD matchNode = 0;
+			for( HTREEITEM child = reinterpret_cast<HTREEITEM>(::SendMessageW(window, TVM_GETNEXTITEM,
+				TVGN_CHILD, reinterpret_cast<LPARAM>(current))); child; )
+			{
+				if( ++visited > maximumNodes || ::GetTickCount64() >= deadline ) return false;
+				std::wstring text;
+				if( !TreeItemText(window, child, text) ) return false;
+				if( ::CompareStringOrdinal(text.data(), static_cast<int>(text.size()),
+					component.data(), static_cast<int>(component.size()), TRUE) == CSTR_EQUAL )
+				{
+					if( match ) return false; // duplicate child name, ambiguous
+					match = child;
+					TVITEMW value = {};
+					value.mask = TVIF_PARAM;
+					value.hItem = child;
+					if( !::SendMessageW(window, TVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&value)) ) return false;
+					matchNode = static_cast<DWORD>(value.lParam);
+				}
+				child = reinterpret_cast<HTREEITEM>(::SendMessageW(window, TVM_GETNEXTITEM,
+					TVGN_NEXT, reinterpret_cast<LPARAM>(child)));
+			}
+			if( !match || !matchNode ) return false;
+			current = match;
+			currentNode = matchNode;
+			if( end == std::wstring::npos ) break;
+			offset = end + 1;
+		}
+		TVITEMW verify = {};
+		verify.mask = TVIF_PARAM | TVIF_STATE;
+		verify.stateMask = TVIS_EXPANDED;
+		verify.hItem = current;
+		if( !::SendMessageW(window, TVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&verify))
+			|| static_cast<DWORD>(verify.lParam) != currentNode ) return false;
+		TreeNodePathIdentity identity = {};
+		if( ReadTreeNodePathIdentity(currentNode, identity, true) && identity.pathKnown )
+		{
+			std::wstring decoded;
+			if( !ReadDelphiAnsiTreePath(CP_ACP, identity.cachedPath, decoded)
+				|| ::CompareStringOrdinal(decoded.data(), static_cast<int>(decoded.size()),
+					path.data(), static_cast<int>(path.size()), TRUE) != CSTR_EQUAL ) return false;
+		}
+		item = current;
+		node = currentNode;
+		expandedState = (verify.state & TVIS_EXPANDED) != 0;
+		return true;
+	}
+	catch( ... ) { item = nullptr; node = 0; expandedState = false; return false; }
+}
+
+bool FindExpandedTreeNodeByPath(HWND window, UINT codePage, const std::wstring& path,
+	DWORD timeBudgetMs, unsigned maximumNodes, HTREEITEM& item, DWORD& node,
+	bool allowCollapsed, bool* expandedState)
+{
+	if( expandedState ) *expandedState = false;
 	item = nullptr;
 	node = 0;
 	gTreePathSearchVisited = 0;
@@ -276,13 +447,15 @@ bool FindExpandedTreeNodeByPath(HWND window, UINT codePage, const std::wstring& 
 		verify.hItem = match;
 		TreeNodePathIdentity verified = {};
 		if( !::SendMessageW(window, TVM_GETITEMW, 0, reinterpret_cast<LPARAM>(&verify))
-			|| static_cast<DWORD>(verify.lParam) != matchNode || !(verify.state & TVIS_EXPANDED)
-			|| !ReadTreeNodePathIdentity(matchNode, verified)
+			|| static_cast<DWORD>(verify.lParam) != matchNode
+			|| (!allowCollapsed && !(verify.state & TVIS_EXPANDED))
+			|| !ReadTreeNodePathIdentity(matchNode, verified, true)
 			|| !CachedTreePathMatches(codePage, verified.cachedPath, path) )
 		{
 			gTreePathSearchVerifyFailed = true;
 			return false;
 		}
+		if( expandedState ) *expandedState = (verify.state & TVIS_EXPANDED) != 0;
 		item = match;
 		node = matchNode;
 		return true;

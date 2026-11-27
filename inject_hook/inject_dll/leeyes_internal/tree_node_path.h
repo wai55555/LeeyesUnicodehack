@@ -28,8 +28,17 @@ bool ReadDelphiAnsiTreePath(UINT codePage, DWORD pathPointer, std::wstring& deco
 bool CachedTreePathMatches(UINT codePage, DWORD cachedPath, const std::wstring& expected);
 bool ReadTreeNodePathIdentity(DWORD node, TreeNodePathIdentity& identity,
 	bool allowMissingPath = false);
+// With allowCollapsed the search also accepts a node that is not expanded and
+// reports its expanded state, so a caller can decide whether the parent can be
+// batched in the flat-folder mode.
 bool FindExpandedTreeNodeByPath(HWND window, UINT codePage, const std::wstring& path,
-	DWORD timeBudgetMs, unsigned maximumNodes, HTREEITEM& item, DWORD& node);
+	DWORD timeBudgetMs, unsigned maximumNodes, HTREEITEM& item, DWORD& node,
+	bool allowCollapsed = false, bool* expandedState = nullptr);
+// Finds a node whose path cache is not populated yet by locating the closest
+// ancestor with a known path and descending through exact child item names.
+bool FindTreeNodeByPathComponents(HWND window, UINT codePage, const std::wstring& path,
+	DWORD timeBudgetMs, unsigned maximumNodes, HTREEITEM& item, DWORD& node,
+	bool& expandedState);
 bool TreeOwnerContainsWindow(DWORD owner, HWND window);
 bool FindTreeViewWindow(DWORD owner, DWORD threadId, HWND& window);
 
