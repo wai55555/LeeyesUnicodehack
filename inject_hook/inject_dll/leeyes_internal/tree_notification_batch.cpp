@@ -49,7 +49,11 @@ namespace LeeyesInternal
 namespace
 {
 
-const size_t kParentCapacity = 2;
+// One watcher process per tracked parent. Four covers a move plus a second
+// concurrent operation (source/destination pairs), so a third or fourth folder
+// that changes at the same time is still batched instead of falling back to a
+// tree search per notification.
+const size_t kParentCapacity = 4;
 const size_t kShadowChildLimit = 4096;
 const size_t kRemovalCompareLimit = 8192;
 const ULONGLONG kTreeCompareBudgetMs = 8;
