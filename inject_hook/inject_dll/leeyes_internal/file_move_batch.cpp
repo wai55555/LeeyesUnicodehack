@@ -2558,6 +2558,7 @@ DWORD RestoreListSelection(const ListSelectionSnapshot& snapshot, bool preserveO
 	// the item that now occupies the old row (the next file), else the previous
 	// one. With no files left the list stays unfocused, so Leeyes focuses the
 	// folder itself.
+	int nearestVisible = -1;
 	const bool focusLost = focusedIndex < 0 && restored == 0
 		&& !snapshot.focusedName.empty() && snapshot.originalFocusedIndex >= 0;
 	if( focusLost && itemCount > 0 )
@@ -2569,7 +2570,7 @@ DWORD RestoreListSelection(const ListSelectionSnapshot& snapshot, bool preserveO
 		state.state = LVIS_SELECTED | LVIS_FOCUSED;
 		::SendMessageA(snapshot.window, LVM_SETITEMSTATE,
 			static_cast<WPARAM>(nearest), reinterpret_cast<LPARAM>(&state));
-		::SendMessageA(snapshot.window, LVM_ENSUREVISIBLE, static_cast<WPARAM>(nearest), FALSE);
+		nearestVisible = nearest;
 		focusedIndex = nearest;
 		restored = 1;
 		#if UNICODEHACK_PATH_DEBUG
@@ -2601,6 +2602,12 @@ DWORD RestoreListSelection(const ListSelectionSnapshot& snapshot, bool preserveO
 					static_cast<LPARAM>((topIndex - currentTop) * itemHeight));
 		}
 	}
+	// The saved top row is restored first (unchanged behaviour for name-based
+	// restores). When the focused entry disappeared, scroll the replacement into
+	// view instead, otherwise the user still sees the old top row.
+	if( nearestVisible >= 0 )
+		::SendMessageA(snapshot.window, LVM_ENSUREVISIBLE,
+			static_cast<WPARAM>(nearestVisible), FALSE);
 	#if UNICODEHACK_PATH_DEBUG
 	if( ::GetEnvironmentVariableA("LEYEES_SELECTION_FULL_SCAN_VERIFY", nullptr, 0) )
 	{
@@ -2910,6 +2917,9 @@ bool EnsureListDeleteWorker(HWND window, void* owner, const char* directory)
 		try { if( !gListDeleteWorker->SetTarget(target) ) return false; }
 		catch( ... ) { return false; }
 		gListDeleteBatch.target = target;
+		// A switch to a different folder invalidates the saved pre-change focus
+		// (the first binding of this batch must keep it).
+		if( !gListDeleteBatch.target.empty() ) gPreChangeSelectionValid = false;
 		#if UNICODEHACK_PATH_DEBUG
 		WriteDiagnostic("list_delete target_changed=1");
 		#endif
@@ -2963,6 +2973,13 @@ void ScheduleListDeleteRefresh(bool apply, bool bootstrap)
 LRESULT CALLBACK ListDeleteBatchSubclass(HWND window, UINT message, WPARAM wParam, LPARAM lParam,
 	UINT_PTR subclassId, DWORD_PTR)
 {
+	// A mouse or keyboard selection made by the user after the change started
+	// must not be overwritten by the saved pre-change selection. Leeyes' own
+	// focus move after a deletion uses no input message, so that case keeps the
+	// saved row.
+	if( gPreChangeSelectionValid && (message == WM_LBUTTONDOWN || message == WM_LBUTTONUP
+		|| message == WM_RBUTTONDOWN || message == WM_KEYDOWN || message == WM_CHAR) )
+		gPreChangeSelectionValid = false;
 	if( message == WM_TIMER && wParam == subclassId )
 	{
 		if( gDrainState.depth || !gListDeleteWorker || gListDeleteBatch.window != window
@@ -3102,7 +3119,10 @@ LRESULT CALLBACK ListDeleteBatchSubclass(HWND window, UINT message, WPARAM wPara
 						// Prefer the focus from before the queued changes. Leeyes may
 						// already have removed the focused row, which moves the control
 						// focus to the previous item.
-						if( gPreChangeSelectionValid
+						WriteDiagnostic("focus_anchor apply valid=%d anchor_window=%p batch_window=%p age=%llu",
+							gPreChangeSelectionValid ? 1 : 0, gPreChangeSelection.window, window,
+							static_cast<unsigned long long>(::GetTickCount64() - gPreChangeSelectionTick));
+						if( gPreChangeSelectionValid && gPreChangeSelection.window == window
 							&& (!selection.window || gPreChangeSelection.window == selection.window)
 							&& ::GetTickCount64() - gPreChangeSelectionTick <= 10000 )
 						{
@@ -3266,17 +3286,21 @@ LRESULT CALLBACK ListDeleteBatchSubclass(HWND window, UINT message, WPARAM wPara
 void ObserveListDeleteBatch(void* owner, HWND window, const char* directory)
 {
 	gDrainState.listStateWatchAttempted = true;
+	// Keep the pre-change focus for the pending apply only. A stale anchor (no
+	// apply followed) must not be reused by a later, unrelated batch.
+	const ULONGLONG anchorNow = ::GetTickCount64();
+	if( gPreChangeSelectionValid && (anchorNow - gPreChangeSelectionTick > 2000
+		|| (window && gPreChangeSelection.window != window)) )
+		gPreChangeSelectionValid = false;
 	if( !gPreChangeSelectionValid && window )
 	{
 		ListSelectionSnapshot before = CaptureListSelection(window);
-		{
-			gPreChangeSelection = before;
-			gPreChangeSelectionValid = !before.focusedName.empty();
-			gPreChangeSelectionTick = ::GetTickCount64();
-			WriteDiagnostic("focus_anchor capture_focus=%d focus_len=%u sel=%lu",
-				before.originalFocusedIndex, static_cast<unsigned>(before.focusedName.size()),
-				static_cast<unsigned long>(before.selectedNames.size()));
-		}
+		gPreChangeSelection = before;
+		gPreChangeSelectionValid = !before.focusedName.empty();
+		gPreChangeSelectionTick = anchorNow;
+		WriteDiagnostic("focus_anchor capture_focus=%d focus_len=%u sel=%lu",
+			before.originalFocusedIndex, static_cast<unsigned>(before.focusedName.size()),
+			static_cast<unsigned long>(before.selectedNames.size()));
 	}
 	if( !EnsureListDeleteWorker(window, owner, directory) ) return;
 	gListDeleteBatch.observedDirty = gListDeleteWorker->DirtyFrames();
@@ -3334,6 +3358,8 @@ void CompleteListDeleteBatchLegacyResync(void* owner, HWND window, const char* d
 	// establishes the initial baseline.
 	if( legacyResynced )
 	{
+		// The list was rebuilt by Leeyes; the saved pre-change rows are stale.
+		gPreChangeSelectionValid = false;
 		gListDeleteBatch.committed.reset();
 		gListDeleteBatch.pendingApply = false;
 		gListDeleteBatch.bootstrapPending = true;
